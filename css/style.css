@@ -91,7 +91,8 @@ i{font-style:normal}
 
 @media (max-width:560px){
   .bar{gap:6px;padding:8px 10px}
-  .meta{font-size:11px;padding:2px 6px}
+  /* 窄屏优先保证按钮可点：base_url / token 状态用 config 命令看得到，这里让位 */
+  .meta{display:none}
   .chip{padding:5px 8px;font-size:11px}
   .out{font-size:12px;padding:10px 12px 16px}
   .inputline{padding:8px 10px}
