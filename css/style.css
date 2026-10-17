@@ -1,0 +1,99 @@
+:root{
+  --bg:#0b0e14; --bg2:#0d1117; --bar:#11161f; --line:#21262d;
+  --fg:#c9d1d9; --dim:#7d8590; --cyan:#39d0d8; --green:#3fb950;
+  --red:#f85149; --yellow:#e3b341; --blue:#79c0ff; --purple:#d2a8ff;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%}
+body{
+  background:var(--bg); color:var(--fg);
+  font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  font-size:14px; overflow:hidden;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+.app{display:flex;flex-direction:column;height:100dvh;max-width:1100px;margin:0 auto;
+     border-left:1px solid var(--line);border-right:1px solid var(--line)}
+
+/* ── 顶栏 ── */
+.bar{
+  display:flex;align-items:center;gap:10px;flex-wrap:nowrap;
+  padding:10px 14px;background:var(--bar);border-bottom:1px solid var(--line);
+  min-height:52px;
+}
+.logo{font-family:var(--mono);font-size:17px;font-weight:700;letter-spacing:1px;color:var(--fg);white-space:nowrap}
+.logo .to{color:var(--cyan)}
+.meta{
+  font-family:var(--mono);font-size:12px;color:var(--dim);
+  background:#0b0e14;border:1px solid var(--line);border-radius:6px;
+  padding:3px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34vw;
+}
+.meta.ok{color:var(--green);border-color:#1f4d2a}
+.spacer{flex:1}
+.chip{
+  background:#0b0e14;color:var(--dim);border:1px solid var(--line);
+  border-radius:6px;font-size:12px;padding:6px 10px;cursor:pointer;white-space:nowrap;
+  font-family:var(--mono);
+}
+.chip:hover{color:var(--cyan);border-color:var(--cyan)}
+.chip:active{transform:scale(.96)}
+
+/* ── 输出区 ── */
+.out{
+  flex:1;overflow-y:auto;overflow-x:hidden;padding:14px 16px 20px;
+  font-family:var(--mono);font-size:13px;line-height:1.65;
+  -webkit-overflow-scrolling:touch;
+}
+.out .ln{white-space:pre-wrap;word-break:break-word}
+.out .echo{color:var(--cyan);margin:10px 0 2px}
+.out .echo .m{font-weight:700}
+.out .body{margin:2px 0 10px}
+.out .stat{margin:8px 0 2px;font-weight:700}
+.out .stat.s2{color:var(--green)}
+.out .stat.s3{color:var(--cyan)}
+.out .stat.s4,.out .stat.s5{color:var(--red)}
+.out .rule{color:var(--line);margin:0 0 4px}
+.out .err{color:var(--red);white-space:pre-wrap;margin:2px 0 10px}
+.out .tip{color:var(--yellow);margin:2px 0 10px}
+.out .dim{color:var(--dim)}
+.out .ok{color:var(--green)}
+.out .hd{color:var(--yellow);font-weight:700}
+.out .banner{color:var(--cyan);white-space:pre;margin:0 0 12px;line-height:1.35;font-size:12px}
+.out .cmdline{color:var(--blue);cursor:pointer}
+.out .cmdline:hover{text-decoration:underline;color:var(--cyan)}
+
+/* JSON 着色 */
+i{font-style:normal}
+.jk{color:var(--blue)}
+.js{color:var(--green)}
+.jn{color:var(--yellow)}
+.jb{color:var(--purple)}
+
+/* ── 输入行 ── */
+.inputline{
+  display:flex;align-items:center;gap:8px;
+  padding:10px 14px;background:var(--bar);border-top:1px solid var(--line);
+}
+.prompt{font-family:var(--mono);color:var(--cyan);font-weight:700;white-space:nowrap}
+#cmd{
+  flex:1;min-width:0;background:#0b0e14;color:var(--fg);
+  border:1px solid var(--line);border-radius:8px;
+  padding:10px 12px;font-family:var(--mono);font-size:16px; /* 16px 防止 iOS 缩放 */
+  outline:none;
+}
+#cmd:focus{border-color:var(--cyan)}
+.send{
+  background:var(--cyan);color:#04121a;border:none;border-radius:8px;
+  font-size:14px;font-weight:700;padding:0 16px;height:40px;cursor:pointer;white-space:nowrap;
+}
+.send:active{transform:scale(.96)}
+
+@media (max-width:560px){
+  .bar{gap:6px;padding:8px 10px}
+  .meta{font-size:11px;padding:2px 6px}
+  .chip{padding:5px 8px;font-size:11px}
+  .out{font-size:12px;padding:10px 12px 16px}
+  .inputline{padding:8px 10px}
+  .send{padding:0 12px}
+}
