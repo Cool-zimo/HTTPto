@@ -715,7 +715,7 @@
   // ── 内置命令输出 ──
   function showHelp() {
     return [
-      'HTTPto v3.0 — 网页版 HTTP 终端',
+      'HTTPto v5.0 — 网页版 HTTP 终端',
       '',
       '📌 请求语法:',
       '  METHOD /path [body] [flags]',
@@ -754,6 +754,20 @@
       '  mock 201 {"id":1} 模拟响应，不真发请求',
       '  A | B            管道：B 里用 {0} / {0.login} 引用 A 的响应',
       '      GET /users/Cool-zimo | GET /users/{0.login}/repos',
+      '',
+      '📌 & 分隔符（请求 + 处理代码）:',
+      '  "JS代码" & 请求      或      请求 & "JS代码"',
+      '      GET /users/Cool-zimo & "resp.login"',
+      '      "log(resp.public_repos)" & GET /users/Cool-zimo',
+      '  ⚠️ 网页里没有 Python，这里跑的是 JavaScript。',
+      '     可用变量: resp（响应对象） status（状态码）',
+      '     可用函数: log() print() json() keys() len()',
+      '',
+      '📌 PYON 块（多行，攒着一起跑）:',
+      '  pyon',
+      '  ... "resp.login" & GET /users/Cool-zimo',
+      '  ... "log(keys(resp))"        ← 纯代码行，resp 沿用上一次',
+      '  ... PYEND                    ← 到此执行',
       '',
       '📌 快捷键:',
       '  Tab 补全  ↑↓ 翻历史  Ctrl+L 清屏  Esc 取消多行',
@@ -902,12 +916,12 @@
   // 提示符变成 ... ，继续敲下一行，闭合后自动发送。
   var _cont = null;   // {buf, method, path}
 
-  function setContMode(on) {
+  function setContMode(on, ph) {
     var pr = document.querySelector('.prompt');
     if (pr) pr.textContent = on ? '...' : '>>>';
     var f = document.getElementById('form');
     if (f) f.classList.toggle('cont', !!on);
-    cmd.placeholder = on ? '继续输入，闭合 } 或 ] 后自动发送（输入 cancel 放弃）'
+    cmd.placeholder = on ? (ph || '继续输入，闭合 } 或 ] 后自动发送（输入 cancel 放弃）')
                          : 'GET /user    试试 help';
     var c = document.getElementById('btnCancel');
     if (c) c.style.display = on ? '' : 'none';
@@ -922,6 +936,24 @@
   function run(raw) {
     raw = raw.trim();
 
+    // ── PYON 续行：只收集，PYEND 时一次性执行 ──
+    if (_pyon) {
+      var lp = raw.toLowerCase();
+      if (lp === 'cancel') {
+        _pyon = null; setContMode(false);
+        print('<span class="dim">（已取消 PYON 块）</span>');
+        return;
+      }
+      if (lp === 'pyend') {
+        var pl0 = _pyon; _pyon = null;
+        setContMode(false);
+        execPyon(pl0);
+        return;
+      }
+      if (raw) _pyon.push(raw);
+      return;
+    }
+
     // ── 续行模式：先把这一行并进缓冲 ──
     if (_cont) {
       if (raw.toLowerCase() === 'cancel') { cancelCont(); return; }
@@ -935,6 +967,16 @@
     }
 
     if (!raw) return;
+
+    // ── PYON 块入口 ──
+    var lw0 = raw.toLowerCase();
+    if (lw0 === 'pyon' || lw0 === 'js pyon' || lw0 === 'python pyon') {
+      _pyon = [];
+      setContMode(true, '"JS代码" & GET /path   或纯代码行；PYEND 执行，cancel 放弃');
+      print('<span class="tip">（PYON 模式）每行写 "代码" & 请求命令，或只写代码沿用上次 resp；' +
+            '输入 PYEND 执行，cancel 放弃</span>');
+      return;
+    }
 
     // ── `> 文件名` 重定向：转成 -output= ──
     // ★ 必须要求 > 是独立 token（前面有空格）。
@@ -952,6 +994,16 @@
       return a + '******（' + v.length + ' 位）';
     });
     print('<span class="echo"><span class="m">&gt;&gt;&gt;</span> ' + esc(echo) + '</span>');
+
+    // ── & 分隔符：一边请求，另一边用 JS 处理 resp ──
+    // ★ 必须排在续行检测前面：POST /x {a:1} & "log(resp)" 的 body 是未闭合的，
+    //   先判续行会把整行吞进 body 缓冲，& 永远轮不到执行。
+    var amp = splitAmp(raw);
+    if (amp) {
+      var am = runAmp(amp[0], amp[1]);
+      if (am) print('<span class="err">' + esc(am) + '</span>');
+      return;
+    }
 
     // ── 判断是否要进入续行模式 ──
     // 只看命令尾部那个没闭合的 { 或 [，且必须是 POST/PUT/PATCH。
@@ -1150,6 +1202,184 @@
     }
   }
 
+  // ══════════════════════════════════════════════════════════════
+  //  & 分隔符 / PYON 块
+  //  命令行版是 python "code" & CLI，用 Python 处理 resp。
+  //  网页里没有 Python 解释器（Pyodide 要拉 ~10MB wasm，首屏受不了），
+  //  所以这里跑的是 JavaScript —— 语义一一对应：resp 就是响应对象。
+  // ══════════════════════════════════════════════════════════════
+
+  // ★ & 在 URL 查询串里太常见了（?a=1&b=2、q:python&sort=stars），
+  //   见 & 就切会把搜索条件拦腰砍断，而且不报错。
+  //   只认前后是空白的独立 &；紧贴字符的一律当 URL 的一部分。
+  function splitAmp(raw) {
+    var m = raw.match(/(?:^|\s)&(?:\s|$)/);
+    if (!m) return null;
+    var idx = raw.indexOf(m[0]);
+    return [raw.slice(0, idx), raw.slice(idx + m[0].length)];
+  }
+
+  // 这一段是请求命令还是 JS 代码？
+  function isCliCmd(s) {
+    s = String(s || '').trim();
+    if (!s) return false;
+    if (/^(GET|POST|PUT|PATCH|DELETE)\b/i.test(s)) return true;
+    if (s.charAt(0) === '!') return true;
+    return /^(help|config|apis|fields|history|presets)\b/i.test(s);
+  }
+
+  function stripQuotes(s) {
+    s = String(s || '').trim();
+    if (s.length >= 2 && ((s[0] === '"' && s[s.length - 1] === '"') ||
+                          (s[0] === "'" && s[s.length - 1] === "'"))) {
+      return s.slice(1, -1);
+    }
+    return s;
+  }
+
+  // 执行一段 JS：resp / status 注入为变量，log() 输出到终端。
+  // ★ 先按表达式试（自动输出值），SyntaxError 才退成语句块跑。
+  //   这样 `resp.login` 和 `for(...) log(...)` 都能用，不用用户记规则。
+  function execJs(code, resp, status) {
+    var src = String(code || '').trim();
+    if (!src) return true;
+    var buf = [];
+    var sandbox = {
+      resp: resp,
+      status: status,
+      json: function (o) { return JSON.stringify(o, null, 2); },
+      keys: function (o) { return Object.keys(o || {}); },
+      len: function (o) { return (o == null) ? 0 : o.length; },
+      log: function () {
+        var parts = [];
+        for (var i = 0; i < arguments.length; i++) {
+          var a = arguments[i];
+          parts.push(typeof a === 'string' ? a : JSON.stringify(a, null, 2));
+        }
+        buf.push(parts.join(' '));
+      }
+    };
+    sandbox.print = function () { sandbox.log.apply(null, arguments); };
+    var prelude = 'var ' + Object.keys(sandbox).map(function (n) {
+      return n + '=__s.' + n;
+    }).join(',') + ';\n';
+
+    function fmt(v) {
+      return typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+    }
+    var mark = buf.length;
+    try {
+      var ret = new Function('__s', prelude + 'return (' + src + ');')(sandbox);
+      if (buf.length > mark) printRaw(buf.slice(mark).join('\n'), 'body');
+      else if (ret !== undefined && ret !== null) printRaw(fmt(ret), 'body');
+      return true;
+    } catch (e1) {
+      if (!(e1 instanceof SyntaxError)) {
+        print('<span class="err">JS 执行出错: ' + esc(String(e1 && e1.message || e1)) + '</span>');
+        return false;
+      }
+      buf.length = mark;                       // 撤销上一次尝试可能产生的输出
+      try {
+        new Function('__s', prelude + src)(sandbox);
+        if (buf.length > mark) printRaw(buf.slice(mark).join('\n'), 'body');
+        return true;
+      } catch (e2) {
+        print('<span class="err">JS 执行出错: ' + esc(String(e2 && e2.message || e2)) + '</span>');
+        return false;
+      }
+    }
+  }
+
+  // 跑一段请求并把响应对象吐出来（供 & 和 PYON 共用）
+  function runCliFor(cli, quiet) {
+    var res = parseInput(cli);
+    if (typeof res === 'string') { print('<span class="err">' + esc(res) + '</span>'); return null; }
+    if (!res) return null;
+    if (res[0] === 'ALIAS') {
+      var ar = parseInput(res[1]);
+      if (typeof ar === 'string') { print('<span class="err">' + esc(ar) + '</span>'); return null; }
+      res = ar;
+    }
+    if (res[0] !== 'REQUEST') { print('<span class="err">& 的一边只能是请求命令</span>'); return null; }
+    var method = res[1], path = res[2], body = res[3], eh = res[4], flags = res[5] || {};
+    if (flags.params && Object.keys(flags.params).length) {
+      var full = /^https?:\/\//i.test(path) ? path : CONFIG.base_url + path;
+      var qs = Object.keys(flags.params).map(function (k) {
+        return encodeURIComponent(k) + '=' + encodeURIComponent(flags.params[k]);
+      }).join('&');
+      full += (full.indexOf('?') >= 0 ? '&' : '?') + qs;
+      path = full;
+    }
+    if (!quiet) fire(method, path, body, eh, flags);
+    return doRequest(method, path, body, eh).then(function (r) {
+      if (r.failed || r.timeout) return null;
+      var obj = null;
+      try { obj = JSON.parse(r.text); } catch (e) { obj = r.text; }
+      return { obj: obj, status: r.r.status };
+    });
+  }
+
+  // & 分隔：一边请求，另一边 JS。请求先跑，代码后跑（与命令行版一致）。
+  // 顺序靠哪边像请求来定，所以 `code & CLI` 和 `CLI & code` 都认。
+  function runAmp(left, right) {
+    var l = String(left || '').trim(), r = String(right || '').trim();
+    if (!l || !r) return '❌ & 两边都得有内容';
+    var cli, js;
+    if (isCliCmd(l) && !isCliCmd(r)) { cli = l; js = r; }
+    else if (isCliCmd(r) && !isCliCmd(l)) { cli = r; js = l; }
+    else return '❌ & 一边要是请求命令（GET/POST/!别名…），另一边要是 JS 代码';
+
+    var p = runCliFor(cli, false);            // 完整渲染一次，跟单独发一样
+    if (!p) return;
+    p.then(function (got) {
+      if (!got) return;
+      execJs(stripQuotes(js), got.obj, got.status);
+    });
+  }
+
+  // PYON 块：逐行执行，CLI 行的响应沿用给后面的 JS 行
+  var _pyon = null;
+
+  function execPyon(lines) {
+    var st = { obj: null, status: null };
+    var i = 0;
+    function step() {
+      if (i >= lines.length) {
+        print('<span class="tip">✅ PYON 块执行完成（' + lines.length + ' 行）</span>');
+        return;
+      }
+      var line = lines[i++];
+      print('<span class="echo"><span class="m">···</span> ' + esc(line) + '</span>');
+      var amp = splitAmp(line);
+      var cli = null, js = null;
+      if (amp) {
+        var a0 = amp[0].trim(), a1 = amp[1].trim();
+        if (isCliCmd(a0) && !isCliCmd(a1)) { cli = a0; js = a1; }
+        else if (isCliCmd(a1) && !isCliCmd(a0)) { cli = a1; js = a0; }
+        else { cli = a0; js = a1; }            // 判断不了就按写的顺序来
+      } else {
+        js = line.trim();
+      }
+      js = stripQuotes(js);
+
+      function after() { if (js) execJs(js, st.obj, st.status); step(); }
+      if (cli) {
+        var p = runCliFor(cli, true);          // 块内只打一行简报，别刷屏
+        if (!p) { step(); return; }
+        p.then(function (got) {
+          if (got) {
+            st.obj = got.obj; st.status = got.status;
+            print('<span class="dim">  ↳ HTTP ' + got.status + '</span>');
+          }
+          after();
+        });
+      } else {
+        after();
+      }
+    }
+    step();
+  }
+
   // 续行模式收尾：把整段 body 重新走一遍解析（这样 -n / -headers 也能用）
   function finishRequest(method, path, bodyText) {
     var full = method + ' ' + path + ' ' + bodyText;
@@ -1234,9 +1464,9 @@
   function drawBanner() {
     var b = [
       '  ┌────────────────────────────────────────────┐',
-      '  │   HTTPto v3.0 · 任意链接 HTTP 终端          │',
+      '  │   HTTPto v5.0 · 任意链接 HTTP 终端          │',
       '  │   GET / POST / PUT / PATCH / DELETE         │',
-      '  │  管道 · 别名 · 预设 · diff · curl · Tab 补全 │',
+      '  │  & 分隔符 · PYON 块 · 管道 · diff · curl    │',
       '  └────────────────────────────────────────────┘',
       '',
       '  输入 help 看帮助，apis 看速查表。',
@@ -1316,7 +1546,7 @@
   }
 
   var CMDS = ['help', 'config', 'apis', 'fields', 'history', 'presets', 'set',
-              'exit', 'use', 'replay', 'repeat', 'diff', 'gen', 'mock'];
+              'exit', 'use', 'replay', 'repeat', 'diff', 'gen', 'mock', 'pyon'];
   var METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
 
   function complete() {
