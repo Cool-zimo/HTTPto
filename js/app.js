@@ -156,7 +156,8 @@
     return fetch(url, opt).then(function (r) {
       clearTimeout(timer);
       var ms = (performance.now() - t0) / 1000;
-      return r.text().then(function (text) { return { r: r, text: text, ms: ms, url: url, dropped: dropped }; });
+      return r.text().then(function (text) { return { r: r, text: text, ms: ms, url: url, dropped: dropped,
+        sentBody: body === undefined ? null : body, sentExtra: extraHeaders || null }; });
     }).catch(function (err) {
       clearTimeout(timer);
       if (err && err.name === 'AbortError') {
@@ -167,7 +168,8 @@
     });
   }
 
-  function render(res, method) {
+  function render(res, method, flags) {
+    flags = flags || {};
     if (res.failed) {
       print('<span class="err">请求失败: ' + esc(res.msg) + '</span>');
       // ★ 带自定义头时，多半是预检（OPTIONS）没过：
@@ -189,7 +191,10 @@
       return;
     }
     var r = res.r;
-    _history.push({ time: now(), method: method, url: res.url, status: r.status });
+    // ★ 记下 body 和 headers，replay 才能原样重发 POST/PUT/PATCH。
+    //   只记 method+url 的话，重发一个建仓库的 POST 会变成空 body，直接 422。
+    _history.push({ time: now(), method: method, url: res.url, status: r.status,
+                    body: res.sentBody || null, headers: res.sentExtra || null });
 
     // 局部 headers 里若含浏览器禁改的头，必须说出来 —— 静默丢弃会让人以为生效了
     if (res.dropped && res.dropped.length) {
@@ -198,24 +203,76 @@
     }
 
     var cls = r.status >= 500 ? 's5' : r.status >= 400 ? 's4' : r.status >= 300 ? 's3' : 's2';
-    print('<span class="stat ' + cls + '">HTTP ' + r.status + '</span>' +
-          ' <span class="dim">(' + res.ms.toFixed(2) + 's)</span>');
-    print('<span class="rule">' + '-'.repeat(50) + '</span>');
+
+    // ── -status：只打印状态码，不要 body ──
+    if (flags.status) {
+      print('<span class="stat ' + cls + '">HTTP ' + r.status + '</span>' +
+            ' <span class="dim">(' + res.ms.toFixed(2) + 's)</span>');
+      return;
+    }
+
+    // ── -raw：只打印响应体，去掉状态和分隔线（方便复制/管道处理）──
+    if (flags.raw) {
+      var rt = (res.text || '').trim();
+      printRaw(rt.length > 6000 ? rt.slice(0, 6000) + '\n… 已截断' : rt, 'body');
+      return;
+    }
+
+    // ── 什么 flag 都没有时才打印完整头 ──
+    if (!flags.quiet) {
+      print('<span class="stat ' + cls + '">HTTP ' + r.status + '</span>' +
+            ' <span class="dim">(' + res.ms.toFixed(2) + 's)</span>');
+      print('<span class="rule">' + '-'.repeat(50) + '</span>');
+    }
 
     var t = (res.text || '').trim();
     if (!t) {
       print('<span class="dim">(空响应体)</span>', 'body');
       return;
     }
-    try {
-      var obj = JSON.parse(t);
+
+    // ── -save=名字：把响应存起来，供 diff 对比 ──
+    if (flags.save) {
+      var sv = null;
+      try { sv = JSON.parse(t); } catch (e) { sv = t; }
+      _saved[flags.save] = { status: r.status, body: sv, at: now(), url: res.url };
+      print('<span class="tip">💾 已保存为 ' + esc(flags.save) + '（HTTP ' + r.status +
+            '）· 用 diff ' + esc(flags.save) + ' 另一份 对比</span>');
+    }
+
+    // ── -output=文件 / > 文件：把响应 body 下载下来 ──
+    if (flags.output) {
+      if (download(flags.output, t)) {
+        print('<span class="tip">💾 响应已写入文件: ' + esc(flags.output) +
+              '（' + t.length + ' 字符）· 浏览器会下载到本地</span>');
+      } else {
+        print('<span class="err">写文件失败，浏览器拒绝了下载</span>');
+      }
+      return;
+    }
+
+    var obj = null, parsed = false;
+    try { obj = JSON.parse(t); parsed = true; } catch (e) {}
+
+    // ── -only=a,b,c：只打印指定字段 ──
+    if (flags.only) {
+      if (!parsed) { print('<span class="err">响应不是 JSON，没法用 -only 挑字段</span>'); return; }
+      var pk = pickFields(obj, flags.only);
+      var pl2 = [];
+      if (pk.miss.length) pl2.push('⚠ 这些字段没找到: ' + pk.miss.join(', '));
+      pl2.push(JSON.stringify(pk.res, null, 2));
+      printRaw(pl2.join('\n'), 'body');
+      return;
+    }
+
+    if (parsed) {
       var pretty = JSON.stringify(obj, null, 2);
       // 太长就截断，避免一次塞几万行把页面卡死
       if (pretty.length > 6000) {
         pretty = pretty.slice(0, 6000) + '\n… 已截断（共 ' + pretty.length + ' 字符）';
       }
       printRaw(pretty, 'body');
-    } catch (e) {
+    } else {
       printRaw(t.length > 3000 ? t.slice(0, 3000) + '\n… 已截断' : t, 'body');
     }
   }
@@ -296,6 +353,22 @@
     return -1;                                                  // 没闭合
   }
 
+  // 所有 flag 的定义：name → {val: 是否取值, kind: 值类型}
+  var FLAGS = {
+    'n':        { val: false },          // 免引号
+    'noquote':  { val: false, alias: 'n' },
+    'raw':      { val: false },          // 只打印响应体
+    'status':   { val: false },          // 只打印状态码
+    'silent':   { val: false },          // 不发请求，只预览
+    'headers':  { val: true, kind: 'json' },
+    'params':   { val: true, kind: 'json' },
+    'output':   { val: true, kind: 'str' },
+    'only':     { val: true, kind: 'str' },
+    'save':     { val: true, kind: 'str' },
+    'timeout':  { val: true, kind: 'num' },
+    'delay':    { val: true, kind: 'num' }
+  };
+
   function splitFlags(text) {
     var last = findBodyEnd(text);
     var bodyPart = text, flagPart = '';
@@ -303,12 +376,16 @@
       // 配对的闭合符后面还有内容，那一段才可能是 flags
       bodyPart = text.slice(0, last + 1);
       flagPart = text.slice(last + 1);
-    } else if (last === -1 && !/[\[{]/.test(text)) {
-      // 整段都不含括号：没有 body，整段都当 flags（如 POST /x -n）
+    } else if (last === -1) {
+      // ★ findBodyEnd 返回 -1 = 没有以括号开头的合法 body，整段都是 flags。
+      //   不能额外要求「整段不含 {」—— -params={q:python} 的值里就有 {，
+      //   加了那个条件会把 GET /x -params={...} 整段当 body，params 静默失效。
       bodyPart = '';
       flagPart = text;
     }
-    var flags = { n: false, headers: undefined, unknown: [] };
+    var flags = { n: false, headers: undefined, params: undefined, output: undefined,
+                  only: undefined, save: undefined, timeout: undefined, delay: undefined,
+                  raw: false, status: false, silent: false, unknown: [] };
     var toks = flagPart.split(/\s+/).filter(Boolean);
     for (var i = 0; i < toks.length; i++) {
       var t = toks[i];
@@ -316,25 +393,131 @@
       var name = t.slice(1), val = null, hasEq = false;
       var eq = name.indexOf('=');
       if (eq >= 0) { val = name.slice(eq + 1); name = name.slice(0, eq); hasEq = true; }
-      name = name.toLowerCase();
-      if (name === 'n' || name === 'noquote') { flags.n = true; continue; }
-      if (name === 'headers') {
-        if (!hasEq) {                              // -headers <下一个 token>
+      var key = name.toLowerCase();
+      var def = FLAGS[key];
+      if (!def) { flags.unknown.push(t); continue; }
+
+      if (def.val) {                                  // 需要取值的 flag
+        if (!hasEq) {
           if (i + 1 < toks.length && toks[i + 1].charAt(0) !== '-') { val = toks[++i]; }
-          else return { err: '❌ -headers 需要值（如 -headers={Accept:xxx} 或 -headers config）' };
+          else return { err: '❌ -' + key + ' 需要值（如 -' + key + '=xxx）' };
         }
-        if (String(val).toLowerCase() === 'config') { flags.headers = undefined; continue; }
-        var hv = null;
-        try { hv = JSON.parse(val); }
-        catch (e) {
-          try { hv = JSON.parse(autoQuote(val)); }
-          catch (e2) { return { err: 'headers 解析失败: ' + e2.message + '\n你输入的: ' + val }; }
+        if (key === 'headers') {
+          if (String(val).toLowerCase() === 'config') { flags.headers = undefined; continue; }
+          var hv = null;
+          try { hv = JSON.parse(val); }
+          catch (e) {
+            try { hv = JSON.parse(autoQuote(val)); }
+            catch (e2) { return { err: 'headers 解析失败: ' + e2.message + '\n你输入的: ' + val }; }
+          }
+          flags.headers = hv; continue;
         }
-        flags.headers = hv; continue;
+        if (key === 'params') {
+          var pv = null;
+          try { pv = JSON.parse(val); }
+          catch (e) {
+            try { pv = JSON.parse(autoQuote(val)); }   // -params={q:python,sort:stars} 免引号
+            catch (e2) { return { err: 'params 解析失败: ' + e2.message + '\n你输入的: ' + val }; }
+          }
+          flags.params = pv; continue;
+        }
+        if (key === 'timeout' || key === 'delay') {
+          var nv = parseInt(val, 10);
+          // delay 允许 0（尽快连发），timeout 至少要 1 秒
+          if (isNaN(nv) || nv < 0 || (key === 'timeout' && nv < 1)) {
+            return { err: '❌ -' + key + ' 必须是' + (key === 'delay' ? '非负' : '正') + '整数，你给的: ' + val };
+          }
+          flags[key] = nv; continue;
+        }
+        flags[key] = val; continue;
       }
-      flags.unknown.push(t);
+      flags[(def.alias || key)] = true;                // 布尔型 flag
     }
     return { bodyPart: bodyPart, flags: flags };
+  }
+
+  // ── 预设环境（use 命令）──
+  var PRESETS = {
+    github: { base_url: 'https://api.github.com', accept: 'application/vnd.github+json' },
+    gitee:  { base_url: 'https://gitee.com/api/v5', accept: 'application/json' },
+    httpbin:{ base_url: 'https://httpbin.org', accept: 'application/json' },
+    jsonph: { base_url: 'https://jsonplaceholder.typicode.com', accept: 'application/json' },
+    local:  { base_url: 'http://127.0.0.1:8000', accept: 'application/json' }
+  };
+
+  // ── 快捷别名（! 命令）──
+  // {0} {1} 依次替换后面的参数
+  var ALIASES = {
+    'user':   'GET /users/{0}',
+    'me':     'GET /user',
+    'repo':   'GET /repos/{0}',
+    'repos':  'GET /user/repos',
+    'search': 'GET /search/repositories -params={q:{0}}',
+    'issues': 'GET /repos/{0}/issues',
+    'rate':   'GET /rate_limit',
+    'stars':  'GET /users/{0}/starred',
+    'followers': 'GET /users/{0}/followers'
+  };
+
+  // ── 响应存档（-save= / diff）──
+  var _saved = {};
+  // ── 上一条原始响应，供 pipe {0} 引用 ──
+  var _lastObj = null;
+  // ── 上一条完整请求（replay 用：需记录 body 与 headers 才能重发）──
+  var _lastReq = null;
+
+  // 按 -only=a,b,c 从对象里挑字段，支持 a.b 形式取嵌套
+  function pickFields(obj, spec) {
+    var keys = String(spec).split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    var res = {}, hit = [];
+    keys.forEach(function (k) {
+      var cur = obj, okAll = true, parts = k.split('.');
+      for (var i = 0; i < parts.length; i++) {
+        if (cur == null || typeof cur !== 'object') { okAll = false; break; }
+        cur = cur[parts[i]];
+      }
+      if (okAll && cur !== undefined) { res[k] = cur; hit.push(k); }
+    });
+    return { res: res, hit: hit, miss: keys.filter(function (k) { return hit.indexOf(k) < 0; }) };
+  }
+
+  // 把响应文本写成本地文件下载
+  function download(name, text) {
+    try {
+      var blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // 生成等价 curl 命令
+  function toCurl(method, url, body, headers) {
+    var parts = ['curl -X ' + method, "'" + url + "'"];
+    Object.keys(headers || {}).forEach(function (k) {
+      parts.push("-H '" + k + ': ' + headers[k] + "'");
+    });
+    if (body != null) parts.push("-d '" + JSON.stringify(body) + "'");
+    return parts.join(' \\\n  ');
+  }
+
+  // 把请求里的 {0} {1}… 替换成上一条响应的字段
+  // 用法：GET /repos/{0.full_name}/issues —— 取上一条响应里的 full_name
+  function subst(str) {
+    if (!str || _lastObj == null) return str;
+    return String(str).replace(/\{(\d+)((?:\.[A-Za-z0-9_]+)*)\}/g, function (m, idx, path) {
+      var v = Array.isArray(_lastObj) ? _lastObj[parseInt(idx, 10)] : _lastObj;
+      if (v == null) return m;
+      var ps = path ? path.slice(1).split('.') : [];
+      for (var i = 0; i < ps.length; i++) {
+        if (v == null) return m;
+        v = v[ps[i]];
+      }
+      return v == null ? m : String(v);
+    });
   }
 
   // ── 命令解析 ──
@@ -348,7 +531,82 @@
     if (low === 'apis') return 'APIS';
     if (low === 'fields') return 'FIELDS';
     if (low === 'history') return 'HISTORY';
+    if (low === 'presets') return ['PRESETS'];
     if (low.startsWith('set ')) return ['SET', raw.slice(4).trim()];
+
+    // ── ! 快捷别名 ──
+    if (raw.charAt(0) === '!') {
+      var ap = raw.slice(1).split(/\s+/).filter(Boolean);
+      var an = (ap[0] || '').toLowerCase();
+      var tpl = ALIASES[an];
+      if (!tpl) {
+        return '未知别名: !' + an + '\n可用: ' + Object.keys(ALIASES).map(function (k) { return '!' + k; }).join(', ');
+      }
+      var exp = tpl.replace(/\{(\d+)\}/g, function (m, d) {
+        var v = ap[1 + parseInt(d, 10)];
+        return v === undefined ? m : v;
+      });
+      if (/\{0\}/.test(exp)) return '❌ !' + an + ' 需要一个参数，如：!' + an + ' Cool-zimo';
+      return ['ALIAS', exp, raw];
+    }
+
+    // ── replay N ──
+    if (low.startsWith('replay ')) {
+      var rn = parseInt(raw.slice(7).trim(), 10);
+      if (!rn) return '用法: replay N（N 是 history 里的序号，从 1 开始）';
+      return ['REPLAY', rn];
+    }
+
+    // ── repeat N <命令> ──
+    if (low.startsWith('repeat ')) {
+      var rp = raw.slice(7).trim().split(/\s+/);
+      var cnt = parseInt(rp[0], 10);
+      if (!cnt || cnt < 1) return '用法: repeat N <命令>，如 repeat 5 GET /rate_limit';
+      if (cnt > 50) return '❌ 一次最多重复 50 次（防误触把限流打满），你给了 ' + cnt;
+      return ['REPEAT', cnt, rp.slice(1).join(' ')];
+    }
+
+    // ── use <preset> ──
+    if (low.startsWith('use ')) {
+      var un = raw.slice(4).trim().toLowerCase();
+      if (!PRESETS[un]) {
+        return '未知预设: ' + un + '\n可用: ' + Object.keys(PRESETS).join(', ') + '\n输入 presets 看详情';
+      }
+      return ['USE', un];
+    }
+
+    // ── diff a b ──
+    if (low.startsWith('diff ')) {
+      var dn = raw.slice(5).trim().split(/\s+/).filter(Boolean);
+      if (dn.length !== 2) return '用法: diff a b（两个都是 -save= 存下来的名字）';
+      return ['DIFF', dn[0], dn[1]];
+    }
+    if (low === 'diff') {
+      var ks = Object.keys(_saved);
+      return ks.length ? '已保存的响应: ' + ks.join(', ') + '\n用法: diff a b'
+                       : '还没有保存过响应。用 -save=名字 保存，如：\n  GET /users/Cool-zimo -save=a';
+    }
+
+    // ── gen <命令> ──
+    if (low.startsWith('gen ')) return ['GEN', raw.slice(4).trim()];
+
+    // ── mock <status> <json> ──
+    if (low.startsWith('mock ')) {
+      var mk = raw.slice(5).trim().split(/\s+/);
+      var st = parseInt(mk[0], 10);
+      if (!st) return '用法: mock 201 {"id":1,"name":"fake"}';
+      return ['MOCK', st, mk.slice(1).join(' ')];
+    }
+
+    // ── 管道：命令1 | 命令2 ──
+    // 只在最外层切一次，body 里的 | 不算
+    if (raw.indexOf('|') >= 0) {
+      var segs = raw.split('|');
+      if (segs.length > 2) return '❌ 最多支持两段管道（a | b），你写了 ' + segs.length + ' 段';
+      var left = segs[0].trim(), right = segs[1].trim();
+      if (!left || !right) return '❌ 管道两边都得有命令，如：GET /users/Cool-zimo | GET /users/{0.login}/repos';
+      return ['PIPE', left, right];
+    }
 
     // ★ 不能照抄 Python 的 raw.split(" ", 2)：
     //   Python 的 maxsplit=2 切出 3 段，JS 的 split(' ',2) 只给 2 段。
@@ -377,6 +635,15 @@
       noQuote = sp.flags.n;
       extraHeaders = sp.flags.headers;
       if (sp.flags.unknown.length) {
+        // ★ 未闭合的 body（{"bad json}）会被当成 unknown flag 报"未知 flag"，
+        //   但用户其实是在写 body 只是写错了 —— 要报 JSON 解析失败才对得上。
+        var maybe = sp.flags.unknown.join(' ');
+        if (/^\s*[[{]/.test(maybe)) {
+          try { JSON.parse(maybe); }
+          catch (e2) {
+            return 'JSON 解析失败: ' + e2.message + '\n解析到的内容:\n' + maybe;
+          }
+        }
         return '未知 flag: ' + sp.flags.unknown.join(' ') +
                '\n支持的: -n / -noquote（自动加引号）、-headers={...} 或 -headers config';
       }
@@ -384,9 +651,28 @@
       var parsed;
       try { parsed = JSON.parse(bodyStr); }
       catch (e) { return 'JSON 解析失败: ' + e.message + '\n解析到的内容:\n' + bodyStr; }
-      return ['REQUEST', method, path, parsed, extraHeaders];
+      return ['REQUEST', method, path, parsed, extraHeaders, sp.flags];
     }
-    return ['REQUEST', method, path, null, extraHeaders];
+    // ★ GET/DELETE 也要带 flags，否则 -save= / -only= / -raw / -status 这类
+    //   不需要 body 的 flag 在没有 body 时全部失效 —— 静默失效，极难察觉。
+    //   （上面的分支只覆盖 POST/PUT/PATCH，sp 是那里的局部变量，这里必须重新解析）
+    if (bodyStr) {
+      var sf = splitFlags(bodyStr);
+      if (sf.err) return sf.err;
+      if (sf.flags.unknown.length) {
+        var maybe2 = sf.flags.unknown.join(' ');
+        if (/^\s*[[{]/.test(maybe2)) {
+          try { JSON.parse(maybe2); }
+          catch (e3) {
+            return 'JSON 解析失败: ' + e3.message + '\n解析到的内容:\n' + maybe2;
+          }
+        }
+        return '未知 flag: ' + sf.flags.unknown.join(' ') +
+               '\n支持的: -params= / -output= / -raw / -status / -only= / -silent / -timeout= / -save= / -headers=';
+      }
+      return ['REQUEST', method, path, null, sf.flags.headers, sf.flags];
+    }
+    return ['REQUEST', method, path, null, null, null];
   }
 
   function handleSet(arg) {
@@ -429,10 +715,10 @@
   // ── 内置命令输出 ──
   function showHelp() {
     return [
-      'HTTPto v2.0 — 网页版 HTTP 终端',
+      'HTTPto v3.0 — 网页版 HTTP 终端',
       '',
       '📌 请求语法:',
-      '  METHOD /path [body] [-n] [-headers={...}]',
+      '  METHOD /path [body] [flags]',
       '  GET    /users/Cool-zimo',
       '  POST   /user/repos {"name":"test","auto_init":true}',
       '  PATCH  /repos/{o}/{r} {"private":true}',
@@ -441,12 +727,36 @@
       '     GET https://httpbin.org/get',
       '',
       '📌 Flags:',
+      '  -params={...}     GET 查询参数，自动拼到 URL 后面',
+      '      GET /search/repositories -params={q:python,sort:stars}',
+      '  -output=file      响应存成文件（也可写  > file ）',
+      '  -raw              只打印响应体，不要状态码和分隔线',
+      '  -status           只打印状态码，不要 body',
+      '  -only=a,b,c       只显示指定字段（支持 a.b 取嵌套）',
+      '  -silent           不发请求，只预览最终 URL + 头 + body',
+      '  -timeout=N        只这次改超时，不动全局',
+      '  -save=名字        保存响应，供 diff 对比',
       '  -n / -noquote     key 和 value 免打引号，自动补上',
       '      POST /user/repos {name:test,private:true} -n',
       '  -headers={...}    局部请求头，只影响这一次',
       '  -headers=config   用回全局请求头（默认）',
       '  ⚠️ 跨域时只有目标站点放行的头才有效（见 fields），',
       '     否则会触发预检失败，请求发不出去 —— 与命令行版不同。',
+      '',
+      '📌 命令:',
+      '  !user Cool-zimo  快捷别名（!me !repo !search !rate !issues…）',
+      '  replay N         重发历史第 N 条（会带上原来的 body）',
+      '  repeat N <命令>   重复 N 次，间隔用 -delay= 调（默认 1s）',
+      '  use github       切换预设环境（github/gitee/httpbin/jsonph/local）',
+      '  presets          列出所有预设',
+      '  diff a b         对比两份 -save= 保存的响应',
+      '  gen GET /user    生成等价 curl 命令',
+      '  mock 201 {"id":1} 模拟响应，不真发请求',
+      '  A | B            管道：B 里用 {0} / {0.login} 引用 A 的响应',
+      '      GET /users/Cool-zimo | GET /users/{0.login}/repos',
+      '',
+      '📌 快捷键:',
+      '  Tab 补全  ↑↓ 翻历史  Ctrl+L 清屏  Esc 取消多行',
       '',
       '📌 多行 JSON:',
       '  POST /user/repos {          ← 括号没闭合就进续行模式',
@@ -625,6 +935,14 @@
     }
 
     if (!raw) return;
+
+    // ── `> 文件名` 重定向：转成 -output= ──
+    // ★ 必须要求 > 是独立 token（前面有空格）。
+    //   `q:python+stars>1000` 里的 > 紧贴字符，是搜索条件的一部分，
+    //   无脑找最后一个 > 会把搜索条件切掉一半，而且不报错。
+    var m = raw.match(/\s+>\s*([^\s>]+)\s*$/);
+    if (m) raw = raw.slice(0, m.index).trim() + ' -output=' + m[1];
+
     _cmdHist.push(raw);
     if (_cmdHist.length > 200) _cmdHist.shift();
     _cmdPos = -1;
@@ -663,8 +981,173 @@
 
     if (res[0] === 'SET') { printRaw(handleSet(res[1]), 'body'); return; }
 
+    // ── ! 别名：展开后回显一次，让人知道它变成了什么 ──
+    if (res[0] === 'ALIAS') {
+      print('<span class="dim">  ↳ ' + esc(res[1]) + '</span>');
+      var ar = parseInput(res[1]);
+      if (typeof ar === 'string') { print('<span class="err">' + esc(ar) + '</span>'); return; }
+      if (ar[0] === 'REQUEST') { fire(ar[1], ar[2], ar[3], ar[4], ar[5]); return; }
+      return;
+    }
+
+    // ── presets ──
+    if (res[0] === 'PRESETS') {
+      var pl = ['可用预设（use <名字> 切换）', '─'.repeat(45), ''];
+      Object.keys(PRESETS).forEach(function (k) {
+        pl.push('  ' + (k + '          ').slice(0, 10) + PRESETS[k].base_url);
+      });
+      pl.push(''); pl.push('  当前: ' + CONFIG.base_url);
+      printRaw(pl.join('\n'), 'body'); return;
+    }
+
+    // ── use ──
+    if (res[0] === 'USE') {
+      var p = PRESETS[res[1]];
+      CONFIG.base_url = p.base_url; CONFIG.accept = p.accept;
+      saveCfg(); syncMeta();
+      printRaw('✅ 已切换到预设 ' + res[1] + '\n   base_url = ' + p.base_url +
+               '\n   accept   = ' + p.accept + '\n   token 沿用不变', 'body');
+      return;
+    }
+
+    // ── replay N ──
+    if (res[0] === 'REPLAY') {
+      if (_history.length < res[1]) {
+        print('<span class="err">历史里只有 ' + _history.length + ' 条，没有第 ' + res[1] + ' 条</span>'); return;
+      }
+      var h = _history[res[1] - 1];
+      // 只记了 method/url，重发时从 url 反推 path
+      var rel = h.url;
+      if (rel.indexOf(CONFIG.base_url) === 0) rel = rel.slice(CONFIG.base_url.length);
+      print('<span class="dim">  ↳ 重发 ' + h.method + ' ' + esc(h.url) +
+            (h.body ? '（带原 body）' : '') + '</span>');
+      fire(h.method, rel, h.body, h.headers, null);
+      return;
+    }
+
+    // ── repeat N <命令> ──
+    if (res[0] === 'REPEAT') {
+      var n = res[1], sub = res[2];
+      var sr = parseInput(sub);
+      if (typeof sr === 'string') { print('<span class="err">' + esc(sr) + '</span>'); return; }
+      if (sr[0] !== 'REQUEST') { print('<span class="err">repeat 后面只能跟请求命令</span>'); return; }
+      var gap = (sr[5] && sr[5].delay) ? sr[5].delay : 1;
+      print('<span class="dim">→ 重复 ' + n + ' 次，间隔 ' + gap + 's：' + esc(sub) + '</span>');
+      var k = 0;
+      (function next() {
+        if (k >= n) { printRaw('✅ 完成 ' + n + ' 次', 'body'); return; }
+        k++;
+        print('<span class="dim">  [' + k + '/' + n + ']</span>');
+        doRequest(sr[1], sr[2], sr[3], sr[4]).then(function (r) {
+          render(r, sr[1]);
+          // 浏览器里没有阻塞式 sleep，只能用 setTimeout 排队；最后一轮不再等
+          if (k < n) setTimeout(next, gap * 1000);
+          else printRaw('✅ 完成 ' + n + ' 次', 'body');
+        });
+      })();
+      return;
+    }
+
+    // ── diff a b ──
+    if (res[0] === 'DIFF') { doDiff(res[1], res[2]); return; }
+
+    // ── gen <命令> ──
+    if (res[0] === 'GEN') {
+      var gr = parseInput(res[1]);
+      if (typeof gr === 'string') { print('<span class="err">' + esc(gr) + '</span>'); return; }
+      if (gr[0] !== 'REQUEST') { print('<span class="err">gen 后面只能跟请求命令</span>'); return; }
+      var gurl = /^https?:\/\//i.test(gr[2]) ? gr[2] : CONFIG.base_url + gr[2];
+      var gh = getHeaders();
+      if (gr[4]) Object.keys(gr[4]).forEach(function (kk) {
+        if (!FORBIDDEN[kk.toLowerCase()]) gh[kk] = gr[4][kk];
+      });
+      if (gr[3] != null) gh['Content-Type'] = 'application/json';
+      printRaw('💡 等价 curl 命令（可复制到服务器跑）\n\n' + toCurl(gr[1], gurl, gr[3], gh), 'body');
+      return;
+    }
+
+    // ── mock ──
+    if (res[0] === 'MOCK') {
+      var mo = null;
+      try { mo = res[2] ? JSON.parse(autoQuote(res[2])) : {}; }
+      catch (e) { print('<span class="err">mock 的 JSON 解析失败: ' + esc(e.message) + '</span>'); return; }
+      printRaw('🧪 模拟响应（没有真的发请求）\n\nHTTP ' + res[1] + '\n' +
+               '-'.repeat(50) + '\n' + JSON.stringify(mo, null, 2), 'body');
+      return;
+    }
+
+    // ── 管道：先跑左边，把响应存进 _lastObj，再展开右边 ──
+    if (res[0] === 'PIPE') { doPipe(res[1], res[2]); return; }
+
     // REQUEST
-    fire(res[1], res[2], res[3], res[4]);
+    fire(res[1], res[2], res[3], res[4], res[5]);
+  }
+
+  // 管道执行：左边请求的结果供右边 {0} / {0.field} 引用
+  function doPipe(left, right) {
+    var lr = parseInput(left);
+    if (typeof lr === 'string') { print('<span class="err">' + esc(lr) + '</span>'); return; }
+    if (lr[0] !== 'REQUEST') { print('<span class="err">管道左边只能是请求命令</span>'); return; }
+    print('<span class="dim">▶ 第一段: ' + esc(left) + '</span>');
+    doRequest(lr[1], lr[2], lr[3], lr[4]).then(function (r) {
+      if (r.failed || r.timeout) { render(r, lr[1]); return; }
+      _lastObj = null;
+      try { _lastObj = JSON.parse(r.text); } catch (e) { _lastObj = null; }
+      if (_lastObj == null) {
+        render(r, lr[1]);
+        print('<span class="err">第一段返回的不是 JSON，没法给第二段提供变量</span>');
+        return;
+      }
+      // 第一段用 -raw/-status 静默掉 body，避免刷屏；只留个提示
+      print('<span class="stat s2">HTTP ' + r.r.status + '</span> <span class="dim">(' +
+            r.ms.toFixed(2) + 's) 第一段完成，结果已存入 {0}</span>');
+      var expanded = subst(right);
+      print('<span class="dim">▶ 第二段: ' + esc(expanded) + '</span>');
+      var rr = parseInput(expanded);
+      if (typeof rr === 'string') { print('<span class="err">' + esc(rr) + '</span>'); return; }
+      if (rr[0] !== 'REQUEST') { print('<span class="err">管道右边只能是请求命令</span>'); return; }
+      fire(rr[1], rr[2], rr[3], rr[4], rr[5]);
+    });
+  }
+
+  // 两份保存的响应做逐行对比，差异高亮
+  function doDiff(a, b) {
+    var A = _saved[a], B = _saved[b];
+    if (!A || !B) {
+      var miss = [!A ? a : null, !B ? b : null].filter(Boolean);
+      print('<span class="err">没找到保存的响应: ' + esc(miss.join(', ')) +
+            '\n已保存的: ' + (Object.keys(_saved).join(', ') || '（无）') + '</span>');
+      return;
+    }
+    var ta = JSON.stringify(A.body, null, 2).split('\n');
+    var tb = JSON.stringify(B.body, null, 2).split('\n');
+    var lns = ['对比 ' + a + ' （HTTP ' + A.status + '） ↔ ' + b + ' （HTTP ' + B.status + '）',
+               '─'.repeat(45), ''];
+    if (A.status !== B.status) {
+      lns.push('⚠ 状态码不同: ' + A.status + ' → ' + B.status);
+      lns.push('');
+    }
+    var max = Math.max(ta.length, tb.length), diffs = 0;
+    for (var i = 0; i < max; i++) {
+      var x = ta[i], y = tb[i];
+      if (x === y) { lns.push('  ' + (x === undefined ? '' : x)); continue; }
+      diffs++;
+      if (x !== undefined) lns.push('- ' + x);
+      if (y !== undefined) lns.push('+ ' + y);
+    }
+    lns.push('');
+    lns.push(diffs ? '共 ' + diffs + ' 处差异（- 是 ' + a + '，+ 是 ' + b + '）' : '✅ 两份响应完全一致');
+    printRaw(lns.join('\n'), 'body');
+    // 差异行再单独上色，纯文本里也能一眼看到
+    var box = document.createElement('div');
+    box.className = 'body';
+    var lastLines = out.querySelectorAll('.ln.body');
+    var target = lastLines[lastLines.length - 1];
+    if (target) {
+      target.innerHTML = target.innerHTML
+        .replace(/^- (.*)$/gm, '<span class="dl">- $1</span>')
+        .replace(/^\+ (.*)$/gm, '<span class="da">+ $1</span>');
+    }
   }
 
   // 续行模式收尾：把整段 body 重新走一遍解析（这样 -n / -headers 也能用）
@@ -673,15 +1156,50 @@
     var res = parseInput(full);
     if (typeof res === 'string') { print('<span class="err">' + esc(res) + '</span>'); return; }
     if (!res || res[0] !== 'REQUEST') { print('<span class="err">解析失败</span>'); return; }
-    fire(res[1], res[2], res[3], res[4]);
+    fire(res[1], res[2], res[3], res[4], res[5]);
   }
 
-  function fire(method, path, body, extraHeaders) {
+  function fire(method, path, body, extraHeaders, flags) {
+    flags = flags || {};
     var full = /^https?:\/\//i.test(path) ? path : CONFIG.base_url + path;
+
+    // params：拼到 URL 后面（GET 搜索/分页靠它）
+    if (flags.params && Object.keys(flags.params).length) {
+      var qs = Object.keys(flags.params).map(function (k) {
+        return encodeURIComponent(k) + '=' + encodeURIComponent(flags.params[k]);
+      }).join('&');
+      full += (full.indexOf('?') >= 0 ? '&' : '?') + qs;
+      path = full;
+    }
+
+    var h = getHeaders();
+    if (extraHeaders) Object.keys(extraHeaders).forEach(function (k) {
+      if (!FORBIDDEN[k.toLowerCase()]) h[k] = extraHeaders[k];
+    });
+
     print('<span class="dim">→ ' + method + ' ' + esc(full) + '</span>');
     if (body) print('<span class="dim">  Body: ' + esc(JSON.stringify(body)) + '</span>');
     if (extraHeaders) print('<span class="dim">  Extra-Headers: ' + esc(JSON.stringify(extraHeaders)) + '</span>');
-    doRequest(method, path, body, extraHeaders).then(function (r) { render(r, method); });
+
+    // ── -silent：只预览，不发请求 ──
+    if (flags.silent) {
+      printRaw('🔇 静默模式（没有真的发请求）\n\n' + method + ' ' + full + '\n' +
+               '-'.repeat(50) + '\nHeaders:\n' + JSON.stringify(h, null, 2) +
+               (body ? '\n\nBody:\n' + JSON.stringify(body, null, 2) : ''), 'body');
+      return;
+    }
+
+    // -timeout= 只覆盖这一次，不动全局配置
+    if (flags.timeout) {
+      var old = CONFIG.timeout;
+      CONFIG.timeout = flags.timeout;
+      doRequest(method, path, body, extraHeaders).then(function (r) {
+        CONFIG.timeout = old;
+        render(r, method, flags);
+      });
+      return;
+    }
+    doRequest(method, path, body, extraHeaders).then(function (r) { render(r, method, flags); });
   }
 
   // 速查表单独渲染：每行可点，点了直接填进输入框
@@ -716,13 +1234,13 @@
   function drawBanner() {
     var b = [
       '  ┌────────────────────────────────────────────┐',
-      '  │   HTTPto v2.2 · 任意链接 HTTP 终端          │',
+      '  │   HTTPto v3.0 · 任意链接 HTTP 终端          │',
       '  │   GET / POST / PUT / PATCH / DELETE         │',
-      '  │   -n 免引号 · -headers 局部头 · 多行 JSON   │',
+      '  │  管道 · 别名 · 预设 · diff · curl · Tab 补全 │',
       '  └────────────────────────────────────────────┘',
       '',
       '  输入 help 看帮助，apis 看速查表。',
-      '  现在试试：GET /users/Cool-zimo',
+      '  现在试试：GET /users/Cool-zimo -only=login',
       ''
     ].join('\n');
     print('<span class="banner">' + esc(b) + '</span>');
@@ -757,8 +1275,72 @@
       e.preventDefault();
       clearLog();
       out.innerHTML = '';
+    } else if (e.key === 'Tab') {
+      e.preventDefault();
+      complete();
     }
   });
+
+  // ── Tab 补全 ──
+  // 浏览器里没有 readline，得自己实现。
+  // 候选 = 内置命令 + 请求方法 + !别名 + use 预设 + 速查表里的路径。
+  function candidates(frag) {
+    var fc = frag.trimLeft();
+    // 以 ! 开头 → 补别名
+    if (fc.charAt(0) === '!') {
+      var an = fc.slice(1);
+      return Object.keys(ALIASES).filter(function (k) { return k.indexOf(an) === 0; })
+                   .map(function (k) { return '!' + k; });
+    }
+    // 第二个词且首词是 use → 补预设名
+    var parts = fc.split(/\s+/);
+    if (parts.length === 2 && parts[0].toLowerCase() === 'use') {
+      return Object.keys(PRESETS).filter(function (k) { return k.indexOf(parts[1].toLowerCase()) === 0; })
+                   .map(function (k) { return 'use ' + k; });
+    }
+    // 第一个词 → 命令 + 方法
+    if (parts.length <= 1) {
+      var w = (parts[0] || '').toUpperCase();
+      return CMDS.concat(METHODS).filter(function (c) { return c.indexOf(w) === 0; });
+    }
+    // 第二个词是路径 → 补速查表里的路径
+    if (parts.length === 2 && METHODS.indexOf(parts[0].toUpperCase()) >= 0) {
+      var pfx = parts[1];
+      var seen = {}, list = [];
+      APIS.forEach(function (a) {
+        if (a[1].indexOf(pfx) === 0 && !seen[a[1]]) { seen[a[1]] = 1; list.push(a[1]); }
+      });
+      return list.map(function (p) { return parts[0].toUpperCase() + ' ' + p; });
+    }
+    return [];
+  }
+
+  var CMDS = ['help', 'config', 'apis', 'fields', 'history', 'presets', 'set',
+              'exit', 'use', 'replay', 'repeat', 'diff', 'gen', 'mock'];
+  var METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+
+  function complete() {
+    var v = cmd.value;
+    var list = candidates(v);
+    if (!list.length) {
+      print('<span class="dim">（没有可补全的）</span>');
+      return;
+    }
+    if (list.length === 1) {
+      cmd.value = list[0] + (list[0].indexOf(' ') >= 0 ? '' : ' ');
+      return;
+    }
+    // 多个候选：先补到公共前缀，再把候选列出来
+    var common = list[0];
+    list.forEach(function (s) {
+      var i = 0;
+      while (i < common.length && i < s.length && common[i] === s[i]) i++;
+      common = common.slice(0, i);
+    });
+    if (common.length > v.trimLeft().length) cmd.value = common;
+    print('<span class="dim">  ' + esc(list.slice(0, 12).join('   ')) +
+          (list.length > 12 ? '  …共 ' + list.length + ' 个' : '') + '</span>');
+  }
 
   document.querySelectorAll('.chip[data-cmd]').forEach(function (b) {
     b.addEventListener('click', function () {
