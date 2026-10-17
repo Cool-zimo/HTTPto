@@ -7,6 +7,8 @@
   'use strict';
 
   var LS = 'httpto_cfg_v1';
+  var LSLOG = 'httpto_log_v2';   // 上次会话的输出记录
+  var LOGLIMIT = 200 * 1024;     // 存档上限，超出就从最早的开始丢
   var CONFIG = {
     base_url: 'https://api.github.com',
     user_agent: 'HTTPto/2.0',
@@ -55,7 +57,59 @@
     d.innerHTML = html;
     out.appendChild(d);
     out.scrollTop = out.scrollHeight;
+    scheduleSave();
     return d;
+  }
+
+  // ── 会话存档 ──
+  // 每次输出后防抖写入，刷新页面自动恢复。
+  // 写失败（配额满 / 隐私模式）一律静默忽略 —— 留不住记录也不能影响使用。
+  var _saveTimer = null;
+  var _noSave = false;      // 启动横幅属于初始状态，不该被当成"上次记录"存进去
+  function scheduleSave() {
+    if (_noSave) return;
+    clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(saveLog, 400);
+  }
+  function saveLog() {
+    try {
+      // ★ 存之前先摘掉"上次保留的记录"那条提示，否则每刷新一次就多一条，越攒越多
+      var tips = out.querySelectorAll('.restore-tip');
+      var saved = [];
+      Array.prototype.forEach.call(tips, function (t) { saved.push([t, t.nextSibling]); t.remove(); });
+      // 超限时从最早的开始丢，别让 localStorage 撑爆
+      while (out.innerHTML.length > LOGLIMIT && out.children.length > 20) {
+        out.removeChild(out.firstChild);
+      }
+      localStorage.setItem(LSLOG, JSON.stringify({
+        html: out.innerHTML,
+        history: _history.slice(-50),
+        ts: Date.now()
+      }));
+      // 提示只是不在存档里，页面上还得留着
+      saved.forEach(function (pair) { out.insertBefore(pair[0], pair[1]); });
+    } catch (e) {}
+  }
+  function clearLog() {
+    // ★ 必须同时取消待触发的写入：否则清屏后那次防抖写回又把旧内容存回来了
+    clearTimeout(_saveTimer);
+    try { localStorage.removeItem(LSLOG); } catch (e) {}
+  }
+  function restoreLog() {
+    var s = null;
+    try { s = JSON.parse(localStorage.getItem(LSLOG) || 'null'); } catch (e) {}
+    if (!s || !s.html) return false;
+    out.innerHTML = s.html;
+    if (Object.prototype.toString.call(s.history) === '[object Array]') _history = s.history;
+    var d = new Date(s.ts || Date.now());
+    var hh = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+    var tip = document.createElement('div');
+    tip.className = 'ln body restore-tip';
+    tip.innerHTML = '<span class="dim">── 以上是上次保留的记录（' + hh +
+      '）· 输入 exit 清屏，或点顶栏「清屏」──</span>';
+    out.appendChild(tip);
+    out.scrollTop = out.scrollHeight;
+    return true;
   }
   function printRaw(text, cls) { return print(hl(text).replace(/\n/g, '<br>'), cls); }
   function syncMeta() {
@@ -244,6 +298,9 @@
       '',
       '📌 快捷键: ↑↓ 翻阅历史命令 · Ctrl+L 清屏',
       '',
+      '📌 记录保留: 会话输出自动存在这台设备上，刷新/关掉再开都还在。',
+      '             输入 exit 或点顶栏「清屏」才会清空。',
+      '',
       '📌 当前 base_url: ' + CONFIG.base_url,
       '📌 Token: ' + (CONFIG.token ? '已配置（' + CONFIG.token.length + ' 位）' : '未配置'),
       '📌 Timeout: ' + CONFIG.timeout + 's'
@@ -350,10 +407,14 @@
     if (_cmdHist.length > 200) _cmdHist.shift();
     _cmdPos = -1;
 
-    print('<span class="echo"><span class="m">&gt;&gt;&gt;</span> ' + esc(raw) + '</span>');
+    // ★ 回显时把 token 打码：这条内容会被存进会话存档，不能让明文 token 落到磁盘/记录里。
+    var echo = raw.replace(/^(set\s+token\s+)(\S+)/i, function (m, a, v) {
+      return a + '******（' + v.length + ' 位）';
+    });
+    print('<span class="echo"><span class="m">&gt;&gt;&gt;</span> ' + esc(echo) + '</span>');
 
     var res = parseInput(raw);
-    if (res === 'EXIT') { out.innerHTML = ''; banner(); return; }
+    if (res === 'EXIT') { clearLog(); out.innerHTML = ''; banner(); return; }
     if (res === 'HELP') { printRaw(showHelp(), 'body'); return; }
     if (res === 'CONFIG') { printRaw(showConfig(), 'body'); return; }
     if (res === 'APIS') { renderApis(); return; }
@@ -392,6 +453,15 @@
   }
 
   function banner() {
+    // 横幅是初始状态，不进存档：否则"清屏"后再刷新，又会冒出"上次保留的记录"
+    _noSave = true;
+    try {
+      drawBanner();
+    } finally {
+      _noSave = false;
+    }
+  }
+  function drawBanner() {
     var b = [
       '  ┌────────────────────────────────────────────┐',
       '  │   HTTPto v2.0 · 任意链接 HTTP 终端          │',
@@ -427,6 +497,7 @@
       else { _cmdPos = -1; cmd.value = ''; }
     } else if (e.key === 'l' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
+      clearLog();
       out.innerHTML = '';
     }
   });
@@ -438,7 +509,18 @@
     });
   });
 
+  var btnClear = document.getElementById('btnClear');
+  if (btnClear) {
+    btnClear.addEventListener('click', function () {
+      clearLog();
+      out.innerHTML = '';
+      banner();
+      cmd.focus();
+    });
+  }
+
   banner();
+  restoreLog();
   syncMeta();
   cmd.focus();
 })();
