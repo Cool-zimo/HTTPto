@@ -88,6 +88,15 @@ i{font-style:normal}
   font-size:14px;font-weight:700;padding:0 16px;height:40px;cursor:pointer;white-space:nowrap;
 }
 .send:active{transform:scale(.96)}
+.cancel{
+  background:#0b0e14;color:var(--red);border:1px solid var(--red);border-radius:8px;
+  font-size:13px;padding:0 12px;height:40px;cursor:pointer;white-space:nowrap;
+}
+.cancel:active{transform:scale(.96)}
+/* 续行模式：整行换色，一眼看出还在等输入 */
+.inputline.cont{background:#151a0f;border-top-color:var(--yellow)}
+.inputline.cont .prompt{color:var(--yellow)}
+.inputline.cont #cmd{border-color:var(--yellow)}
 
 @media (max-width:560px){
   .bar{gap:6px;padding:8px 10px}
