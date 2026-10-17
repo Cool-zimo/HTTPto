@@ -135,12 +135,20 @@
     return h;
   }
 
-  function doRequest(method, path, body) {
+  function doRequest(method, path, body, extraHeaders) {
     var url = /^https?:\/\//i.test(path) ? path : CONFIG.base_url + path;
     var ctrl = new AbortController();
     var timer = setTimeout(function () { ctrl.abort(); }, CONFIG.timeout * 1000);
     var t0 = performance.now();
-    var opt = { method: method, headers: getHeaders(), signal: ctrl.signal, credentials: 'omit' };
+    var h = getHeaders();
+    var dropped = [];
+    if (extraHeaders) {
+      Object.keys(extraHeaders).forEach(function (k) {
+        if (FORBIDDEN[k.toLowerCase()]) { dropped.push(k); return; }   // 浏览器不让改，如实告诉用户
+        h[k] = extraHeaders[k];
+      });
+    }
+    var opt = { method: method, headers: h, signal: ctrl.signal, credentials: 'omit' };
     if (body != null && method !== 'GET' && method !== 'DELETE') {
       opt.headers['Content-Type'] = 'application/json';
       opt.body = JSON.stringify(body);
@@ -148,21 +156,32 @@
     return fetch(url, opt).then(function (r) {
       clearTimeout(timer);
       var ms = (performance.now() - t0) / 1000;
-      return r.text().then(function (text) { return { r: r, text: text, ms: ms, url: url }; });
+      return r.text().then(function (text) { return { r: r, text: text, ms: ms, url: url, dropped: dropped }; });
     }).catch(function (err) {
       clearTimeout(timer);
       if (err && err.name === 'AbortError') {
         return { timeout: true, ms: CONFIG.timeout, url: url };
       }
-      return { failed: true, msg: String(err && err.message || err), url: url };
+      return { failed: true, msg: String(err && err.message || err), url: url,
+               extraKeys: extraHeaders ? Object.keys(extraHeaders) : null };
     });
   }
 
   function render(res, method) {
     if (res.failed) {
       print('<span class="err">请求失败: ' + esc(res.msg) + '</span>');
-      print('<span class="tip">💡 最常见原因是目标站点不允许跨域（CORS）：浏览器拦下了响应，' +
-            '命令没写错。换 api.github.com、httpbin.org 这类支持 CORS 的地址试试。</span>');
+      // ★ 带自定义头时，多半是预检（OPTIONS）没过：
+      //   加任何非白名单的头都会触发预检，服务器不点头，浏览器直接拦掉请求。
+      //   不说清这点，用户会以为是自己命令写错了。
+      if (res.extraKeys && res.extraKeys.length) {
+        print('<span class="tip">💡 这次带了自定义头 ' + esc(res.extraKeys.join(', ')) +
+              '，而浏览器对跨域请求的自定义头要先发一次预检。\n' +
+              '   目标站点没在 Access-Control-Allow-Headers 里放行它，请求就被拦了 —— 不是命令写错。\n' +
+              '   输入 fields 可以看 GitHub 放行的头有哪些。</span>');
+      } else {
+        print('<span class="tip">💡 最常见原因是目标站点不允许跨域（CORS）：浏览器拦下了响应，' +
+              '命令没写错。换 api.github.com、httpbin.org 这类支持 CORS 的地址试试。</span>');
+      }
       return;
     }
     if (res.timeout) {
@@ -171,6 +190,12 @@
     }
     var r = res.r;
     _history.push({ time: now(), method: method, url: res.url, status: r.status });
+
+    // 局部 headers 里若含浏览器禁改的头，必须说出来 —— 静默丢弃会让人以为生效了
+    if (res.dropped && res.dropped.length) {
+      print('<span class="tip">⚠️ 以下请求头被浏览器忽略（网页禁止修改）: ' +
+            esc(res.dropped.join(', ')) + '</span>');
+    }
 
     var cls = r.status >= 500 ? 's5' : r.status >= 400 ? 's4' : r.status >= 300 ? 's3' : 's2';
     print('<span class="stat ' + cls + '">HTTP ' + r.status + '</span>' +
@@ -193,6 +218,123 @@
     } catch (e) {
       printRaw(t.length > 3000 ? t.slice(0, 3000) + '\n… 已截断' : t, 'body');
     }
+  }
+
+  // ── -n 自动加引号 ──
+  // 把 {name:test, age:18, private:true} 转成合法 JSON。
+  // 逐字符扫描，遇到裸词就补引号；字符串/数字/布尔/结构字符原样透出。
+  function autoQuote(s) {
+    var out = '', i = 0, n = s.length;
+    while (i < n) {
+      var c = s[i];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { out += c; i++; continue; }
+      if (c === '"' || c === "'") {                 // 已有引号：原样搬，统一成双引号
+        out += '"'; i++;
+        while (i < n && s[i] !== c) {
+          if (s[i] === '\\' && i + 1 < n) { out += s[i] + s[i + 1]; i += 2; }
+          else { out += s[i]; i++; }
+        }
+        if (i < n) { out += '"'; i++; }
+        continue;
+      }
+      if ('{}[]:,'.indexOf(c) >= 0) { out += c; i++; continue; }
+      if ((c >= '0' && c <= '9') || c === '-') {    // 数字（含负数、小数、指数）
+        var num = '';
+        while (i < n && /[0-9.\-+eE]/.test(s[i])) { num += s[i]; i++; }
+        out += num; continue;
+      }
+      var word = '';                                 // 字母串
+      while (i < n && /[A-Za-z_]/.test(s[i])) { word += s[i]; i++; }
+      if (word === 'true' || word === 'false' || word === 'null') { out += word; continue; }
+      // 既不是纯字母（比如含中文、点、@），继续吃成裸词
+      var bare = word;
+      while (i < n && ' ,:{}[]"\'\n\r\t'.indexOf(s[i]) < 0) { bare += s[i]; i++; }
+      if (bare) out += '"' + bare.replace(/"/g, '\\"') + '"';
+    }
+    return out;
+  }
+
+  function isClosed(s) {
+    var a = 0, b = 0, i;
+    for (i = 0; i < s.length; i++) {
+      if (s[i] === '{') a++; else if (s[i] === '}') a--;
+      else if (s[i] === '[') b++; else if (s[i] === ']') b--;
+    }
+    return a === 0 && b === 0;
+  }
+
+  // ── flags 解析 ──
+  // 只认 -n / -noquote / -headers=... / -headers <值>，其余原样留在 body 里。
+  //
+  // ★ 不能用 lastIndexOf('}') 找 body 结尾 —— 原版 Python 的 rfind("}") 就栽在这：
+  //   -headers={User-Agent:x} 里那个 } 在更右边，于是 rfind 找到的是 headers 自己的 }，
+  //   结果 flagPart 为空、-headers 完全不生效，还会把整段当 JSON 报"解析失败"。
+  //   正确做法是从 body 的第一个括号起做配对扫描，找到与它配对的那个闭合符。
+  function findBodyEnd(s) {
+    var start = -1, i;
+    for (i = 0; i < s.length; i++) {
+      var c = s[i];
+      if (c === '{' || c === '[') { start = i; break; }
+      if (c !== ' ' && c !== '\t' && c !== '\n') return -1;   // 开头不是括号 → 没有 JSON body
+    }
+    if (start < 0) return -1;
+    var depth = 0, inStr = false, q = '';
+    for (i = start; i < s.length; i++) {
+      var ch = s[i];
+      if (inStr) {
+        if (ch === '\\') { i++; continue; }
+        if (ch === q) inStr = false;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { inStr = true; q = ch; continue; }
+      if (ch === '{' || ch === '[') depth++;
+      else if (ch === '}' || ch === ']') {
+        depth--;
+        if (depth <= 0) return i;                              // 与起始括号配对的那个
+      }
+    }
+    return -1;                                                  // 没闭合
+  }
+
+  function splitFlags(text) {
+    var last = findBodyEnd(text);
+    var bodyPart = text, flagPart = '';
+    if (last !== -1 && last < text.length - 1) {
+      // 配对的闭合符后面还有内容，那一段才可能是 flags
+      bodyPart = text.slice(0, last + 1);
+      flagPart = text.slice(last + 1);
+    } else if (last === -1 && !/[\[{]/.test(text)) {
+      // 整段都不含括号：没有 body，整段都当 flags（如 POST /x -n）
+      bodyPart = '';
+      flagPart = text;
+    }
+    var flags = { n: false, headers: undefined, unknown: [] };
+    var toks = flagPart.split(/\s+/).filter(Boolean);
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      if (t.charAt(0) !== '-') { flags.unknown.push(t); continue; }
+      var name = t.slice(1), val = null, hasEq = false;
+      var eq = name.indexOf('=');
+      if (eq >= 0) { val = name.slice(eq + 1); name = name.slice(0, eq); hasEq = true; }
+      name = name.toLowerCase();
+      if (name === 'n' || name === 'noquote') { flags.n = true; continue; }
+      if (name === 'headers') {
+        if (!hasEq) {                              // -headers <下一个 token>
+          if (i + 1 < toks.length && toks[i + 1].charAt(0) !== '-') { val = toks[++i]; }
+          else return { err: '❌ -headers 需要值（如 -headers={Accept:xxx} 或 -headers config）' };
+        }
+        if (String(val).toLowerCase() === 'config') { flags.headers = undefined; continue; }
+        var hv = null;
+        try { hv = JSON.parse(val); }
+        catch (e) {
+          try { hv = JSON.parse(autoQuote(val)); }
+          catch (e2) { return { err: 'headers 解析失败: ' + e2.message + '\n你输入的: ' + val }; }
+        }
+        flags.headers = hv; continue;
+      }
+      flags.unknown.push(t);
+    }
+    return { bodyPart: bodyPart, flags: flags };
   }
 
   // ── 命令解析 ──
@@ -226,12 +368,25 @@
     var path = i2 < 0 ? rest : rest.slice(0, i2);
     var bodyStr = i2 < 0 ? null : rest.slice(i2 + 1).trim();
     if (!path) path = '/';
-    var body = null;
+
+    var extraHeaders = null, noQuote = false;
     if (bodyStr && ['POST', 'PUT', 'PATCH'].indexOf(method) >= 0) {
-      try { body = JSON.parse(bodyStr); }
-      catch (e) { return 'JSON 解析失败: ' + e.message + '\n你输入的: ' + bodyStr; }
+      var sp = splitFlags(bodyStr);
+      if (sp.err) return sp.err;
+      bodyStr = sp.bodyPart;
+      noQuote = sp.flags.n;
+      extraHeaders = sp.flags.headers;
+      if (sp.flags.unknown.length) {
+        return '未知 flag: ' + sp.flags.unknown.join(' ') +
+               '\n支持的: -n / -noquote（自动加引号）、-headers={...} 或 -headers config';
+      }
+      if (noQuote) bodyStr = autoQuote(bodyStr);
+      var parsed;
+      try { parsed = JSON.parse(bodyStr); }
+      catch (e) { return 'JSON 解析失败: ' + e.message + '\n解析到的内容:\n' + bodyStr; }
+      return ['REQUEST', method, path, parsed, extraHeaders];
     }
-    return ['REQUEST', method, path, body];
+    return ['REQUEST', method, path, null, extraHeaders];
   }
 
   function handleSet(arg) {
@@ -277,13 +432,28 @@
       'HTTPto v2.0 — 网页版 HTTP 终端',
       '',
       '📌 请求语法:',
-      '  METHOD /path [body_json]',
+      '  METHOD /path [body] [-n] [-headers={...}]',
       '  GET    /users/Cool-zimo',
       '  POST   /user/repos {"name":"test","auto_init":true}',
       '  PATCH  /repos/{o}/{r} {"private":true}',
       '  DELETE /repos/{o}/{r}',
       '  💡 path 写完整 URL 也可以，会直接用它而不拼 base_url：',
       '     GET https://httpbin.org/get',
+      '',
+      '📌 Flags:',
+      '  -n / -noquote     key 和 value 免打引号，自动补上',
+      '      POST /user/repos {name:test,private:true} -n',
+      '  -headers={...}    局部请求头，只影响这一次',
+      '  -headers=config   用回全局请求头（默认）',
+      '  ⚠️ 跨域时只有目标站点放行的头才有效（见 fields），',
+      '     否则会触发预检失败，请求发不出去 —— 与命令行版不同。',
+      '',
+      '📌 多行 JSON:',
+      '  POST /user/repos {          ← 括号没闭合就进续行模式',
+      '  ... name:test,              ← 提示符变成 ... ，接着敲',
+      '  ... private:true',
+      '  ... } -n                    ← 闭合后自动发送',
+      '  中途输入 cancel 或按 Esc 放弃',
       '',
       '📌 配置命令:',
       '  set base_url https://api.github.com',
@@ -379,10 +549,27 @@
       '│  422 Unprocessable 参数校验失败        │',
       '└──────────────────────────────────────┘',
       '',
+      '┌─ Flags ────────────────────────────────┐',
+      '│  -n            免打引号，自动补上      │',
+      '│  -headers={}   局部请求头，仅当次有效  │',
+      '└──────────────────────────────────────┘',
+      '',
+      '┌─ GitHub 放行的自定义头（实测预检结果）──┐',
+      '│  Authorization  Content-Type  Accept   │',
+      '│  If-Match  If-None-Match               │',
+      '│  If-Modified-Since  If-Unmodified-Since│',
+      '│  X-GitHub-OTP  X-Requested-With        │',
+      '│  GraphQL-Features  X-GitHub-Api-Version│',
+      '│  ⚠️ 除此之外的头（如 X-Test）会触发预检 │',
+      '│     失败，请求根本发不出去             │',
+      '└──────────────────────────────────────┘',
+      '',
       '┌─ 网页版特别注意 ──────────────────────┐',
       '│  CORS：目标站点必须允许跨域，否则浏览器│',
       '│  会拦下响应。报错时多半不是命令写错了。 │',
       '│  GitHub API 与 httpbin.org 都支持 CORS │',
+      '│  另外 User-Agent / Cookie / Referer 等│',
+      '│  浏览器禁止修改，会在输出里明确标出    │',
       '└──────────────────────────────────────┘'
     ].join('\n');
   }
@@ -401,8 +588,43 @@
   }
 
   // ── 执行 ──
+  // 网页版没有真正的多行输入框：body 未闭合时进入「续行模式」，
+  // 提示符变成 ... ，继续敲下一行，闭合后自动发送。
+  var _cont = null;   // {buf, method, path}
+
+  function setContMode(on) {
+    var pr = document.querySelector('.prompt');
+    if (pr) pr.textContent = on ? '...' : '>>>';
+    var f = document.getElementById('form');
+    if (f) f.classList.toggle('cont', !!on);
+    cmd.placeholder = on ? '继续输入，闭合 } 或 ] 后自动发送（输入 cancel 放弃）'
+                         : 'GET /user    试试 help';
+    var c = document.getElementById('btnCancel');
+    if (c) c.style.display = on ? '' : 'none';
+  }
+
+  function cancelCont() {
+    _cont = null;
+    setContMode(false);
+    print('<span class="dim">（已取消多行输入）</span>');
+  }
+
   function run(raw) {
-    if (!raw.trim()) return;
+    raw = raw.trim();
+
+    // ── 续行模式：先把这一行并进缓冲 ──
+    if (_cont) {
+      if (raw.toLowerCase() === 'cancel') { cancelCont(); return; }
+      _cont.buf += '\n' + raw;
+      print('<span class="echo"><span class="m">...</span> ' + esc(raw) + '</span>');
+      if (!isClosed(_cont.buf)) return;          // 还没闭合，继续等
+      var fin = _cont; _cont = null;
+      setContMode(false);
+      finishRequest(fin.method, fin.path, fin.buf);
+      return;
+    }
+
+    if (!raw) return;
     _cmdHist.push(raw);
     if (_cmdHist.length > 200) _cmdHist.shift();
     _cmdPos = -1;
@@ -412,6 +634,23 @@
       return a + '******（' + v.length + ' 位）';
     });
     print('<span class="echo"><span class="m">&gt;&gt;&gt;</span> ' + esc(echo) + '</span>');
+
+    // ── 判断是否要进入续行模式 ──
+    // 只看命令尾部那个没闭合的 { 或 [，且必须是 POST/PUT/PATCH。
+    var i1 = raw.indexOf(' ');
+    var m0 = (i1 < 0 ? raw : raw.slice(0, i1)).toUpperCase();
+    if (['POST', 'PUT', 'PATCH'].indexOf(m0) >= 0) {
+      var rest = i1 < 0 ? '' : raw.slice(i1 + 1).trim();
+      var i2 = rest.indexOf(' ');
+      var p0 = i2 < 0 ? rest : rest.slice(0, i2);
+      var b0 = i2 < 0 ? null : rest.slice(i2 + 1).trim();
+      if (b0 && /^\s*[[{]/.test(b0) && !isClosed(b0)) {
+        _cont = { buf: b0, method: m0, path: p0 || '/' };
+        setContMode(true);
+        print('<span class="tip">（多行模式）继续输入，闭合后自动发送；输入 cancel 放弃</span>');
+        return;
+      }
+    }
 
     var res = parseInput(raw);
     if (res === 'EXIT') { clearLog(); out.innerHTML = ''; banner(); return; }
@@ -425,11 +664,24 @@
     if (res[0] === 'SET') { printRaw(handleSet(res[1]), 'body'); return; }
 
     // REQUEST
-    var method = res[1], path = res[2], body = res[3];
+    fire(res[1], res[2], res[3], res[4]);
+  }
+
+  // 续行模式收尾：把整段 body 重新走一遍解析（这样 -n / -headers 也能用）
+  function finishRequest(method, path, bodyText) {
+    var full = method + ' ' + path + ' ' + bodyText;
+    var res = parseInput(full);
+    if (typeof res === 'string') { print('<span class="err">' + esc(res) + '</span>'); return; }
+    if (!res || res[0] !== 'REQUEST') { print('<span class="err">解析失败</span>'); return; }
+    fire(res[1], res[2], res[3], res[4]);
+  }
+
+  function fire(method, path, body, extraHeaders) {
     var full = /^https?:\/\//i.test(path) ? path : CONFIG.base_url + path;
     print('<span class="dim">→ ' + method + ' ' + esc(full) + '</span>');
     if (body) print('<span class="dim">  Body: ' + esc(JSON.stringify(body)) + '</span>');
-    doRequest(method, path, body).then(function (r) { render(r, method); });
+    if (extraHeaders) print('<span class="dim">  Extra-Headers: ' + esc(JSON.stringify(extraHeaders)) + '</span>');
+    doRequest(method, path, body, extraHeaders).then(function (r) { render(r, method); });
   }
 
   // 速查表单独渲染：每行可点，点了直接填进输入框
@@ -464,8 +716,9 @@
   function drawBanner() {
     var b = [
       '  ┌────────────────────────────────────────────┐',
-      '  │   HTTPto v2.0 · 任意链接 HTTP 终端          │',
+      '  │   HTTPto v2.2 · 任意链接 HTTP 终端          │',
       '  │   GET / POST / PUT / PATCH / DELETE         │',
+      '  │   -n 免引号 · -headers 局部头 · 多行 JSON   │',
       '  └────────────────────────────────────────────┘',
       '',
       '  输入 help 看帮助，apis 看速查表。',
@@ -484,6 +737,11 @@
   });
 
   cmd.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      if (_cont) { e.preventDefault(); cancelCont(); }
+      return;
+    }
+    if (_cont) return;                 // 续行模式下不接管 ↑↓，避免把半截 JSON 翻没了
     if (e.key === 'ArrowUp') {
       e.preventDefault();
       if (!_cmdHist.length) return;
@@ -517,6 +775,12 @@
       banner();
       cmd.focus();
     });
+  }
+
+  var btnCancel = document.getElementById('btnCancel');
+  if (btnCancel) {
+    btnCancel.style.display = 'none';
+    btnCancel.addEventListener('click', function () { cancelCont(); cmd.focus(); });
   }
 
   banner();
