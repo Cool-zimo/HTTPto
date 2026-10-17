@@ -21,13 +21,23 @@
     Object.keys(CONFIG).forEach(function (k) { if (saved[k] != null) CONFIG[k] = saved[k]; });
   } catch (e) { /* 存档坏了就用默认值，不影响启动 */ }
 
+  var LSPY = 'httpto_py_v1';
   function saveCfg() {
     try { localStorage.setItem(LS, JSON.stringify(CONFIG)); } catch (e) {}
   }
+  function loadPyPref() {
+    try { _pyPref = localStorage.getItem(LSPY) === 'on'; } catch (e) { _pyPref = false; }
+  }
+  function savePyPref(on) {
+    _pyPref = !!on;
+    try { localStorage.setItem(LSPY, on ? 'on' : 'off'); } catch (e) {}
+  }
+  loadPyPref();
 
   var _history = [];      // 请求历史（history 命令）
   var _cmdHist = [];      // 命令行历史（↑↓ 翻阅）
   var _cmdPos = -1;
+  var _pyPref = false;    // "set download_python" 的偏好，存 localStorage（不自动加载）
 
   var out = document.getElementById('out');
   var form = document.getElementById('form');
@@ -240,11 +250,25 @@
             '）· 用 diff ' + esc(flags.save) + ' 另一份 对比</span>');
     }
 
-    // ── -output=文件 / > 文件：把响应 body 下载下来 ──
+    // ── -output=文件 / > 文件 ──
+    // ★ Python 就绪时写进虚拟盘（这样 cat/ls 才看得到），否则退回浏览器下载。
+    //   网页版拿不到真实文件系统，两种都不是"存到你的磁盘"，要说清。
     if (flags.output) {
+      if (pyReady()) {
+        try {
+          var abs = pyFs().save(flags.output, t);
+          print('<span class="tip">💾 已写入 Python 虚拟盘: ' + esc(abs) +
+                '（' + t.length + ' 字符）· 用 ls / cat ' + esc(flags.output) + ' 查看' +
+                '\n   ⚠️ 这个盘只在内存里，关掉页面就没了 —— 要留下来请用 -output= 关掉 Python，或 gen 导出</span>');
+          return;
+        } catch (e) {
+          print('<span class="err">写入虚拟盘失败: ' + esc(pyErrText(e)) + '</span>');
+          return;
+        }
+      }
       if (download(flags.output, t)) {
-        print('<span class="tip">💾 响应已写入文件: ' + esc(flags.output) +
-              '（' + t.length + ' 字符）· 浏览器会下载到本地</span>');
+        print('<span class="tip">💾 响应已下载为文件: ' + esc(flags.output) +
+              '（' + t.length + ' 字符）· 浏览器会存到本地下载目录</span>');
       } else {
         print('<span class="err">写文件失败，浏览器拒绝了下载</span>');
       }
@@ -587,6 +611,14 @@
                        : '还没有保存过响应。用 -save=名字 保存，如：\n  GET /users/Cool-zimo -save=a';
     }
 
+    // ── 虚拟文件系统命令（需要 Python）──
+    var fw = low.split(/\s+/)[0];
+    if (['pwd', 'ls', 'cd', 'cat', 'mkdir', 'rm', 'tree', 'write'].indexOf(fw) >= 0) {
+      var argTxt = raw.slice(fw.length).trim();
+      if (fw === 'ls' && argTxt === '') argTxt = '.';
+      return ['FS', fw, argTxt];
+    }
+
     // ── gen <命令> ──
     if (low.startsWith('gen ')) return ['GEN', raw.slice(4).trim()];
 
@@ -678,9 +710,12 @@
   function handleSet(arg) {
     var parts = arg.split(' ', 1);
     var i = arg.indexOf(' ');
-    if (i < 0) return '用法: set <key> <value>\n可用 key: base_url, token, timeout, user_agent, accept';
+    if (i < 0) return '用法: set <key> <value>\n可用 key: base_url, token, timeout, user_agent, accept, download_python';
     var key = arg.slice(0, i).toLowerCase();
     var value = arg.slice(i + 1).trim();
+
+    // download_python 要异步加载，不能走普通 set 的同步返回
+    if (key === 'download_python') return ['PYLOAD', value];
 
     if (key === 'base_url') {
       if (!/^https?:/i.test(value)) value = 'https://' + value;
@@ -709,13 +744,53 @@
       CONFIG.accept = value; saveCfg();
       return '✅ accept 已设为: ' + value;
     }
-    return '❌ 未知配置项: ' + key + '\n可用: base_url, token, timeout, user_agent, accept';
+    return '❌ 未知配置项: ' + key +
+           '\n可用: base_url, token, timeout, user_agent, accept, download_python';
+  }
+
+  // set download_python on|off|status
+  // ★ 加载是异步的，所以这条不走 printRaw，而是打一条会原地更新的进度行。
+  function doPyLoad(val) {
+    var v = String(val || '').trim().toLowerCase();
+    if (v === 'status' || v === '') {
+      var s = _pyState === 'ready' ? '已加载（Pyodide ' + PY_VER + '）'
+            : _pyState === 'loading' ? '正在加载…'
+            : _pyState === 'error' ? '上次加载失败'
+            : '未加载';
+      printRaw('download_python: ' + s + '\n' +
+               '  用法: set download_python on   加载（约 10MB）\n' +
+               '        set download_python off  关闭，回到 JavaScript 模式', 'body');
+      return;
+    }
+    if (v === 'off') {
+      savePyPref(false);
+      _py = null; _pyState = 'off'; syncPyMeta();
+      printRaw('✅ Python 已关闭 · & 左边改回 JavaScript，cd/ls/cat 等命令不再可用', 'body');
+      return;
+    }
+    if (v !== 'on') {
+      print('<span class="err">用法: set download_python on | off | status（你给了: ' + esc(val) + '）</span>');
+      return;
+    }
+    savePyPref(true);
+    var ln = document.createElement('div');
+    ln.className = 'ln tip';
+    out.appendChild(ln);
+    out.scrollTop = out.scrollHeight;
+    var t0 = Date.now();
+    ln.textContent = '🐍 正在下载 Python 运行时… 0%';
+    loadPython(function (pct) {
+      ln.textContent = '🐍 正在下载 Python 运行时… ' + pct + '%（' + ((Date.now() - t0) / 1000).toFixed(0) + 's）';
+    }).then(function (st) {
+      if (st !== 'ready') ln.textContent = '❌ Python 加载失败，详见上面的报错';
+      else ln.textContent = '';
+    });
   }
 
   // ── 内置命令输出 ──
   function showHelp() {
     return [
-      'HTTPto v5.0 — 网页版 HTTP 终端',
+      'HTTPto v6.0 — 网页版 HTTP 终端',
       '',
       '📌 请求语法:',
       '  METHOD /path [body] [flags]',
@@ -759,15 +834,24 @@
       '  "JS代码" & 请求      或      请求 & "JS代码"',
       '      GET /users/Cool-zimo & "resp.login"',
       '      "log(resp.public_repos)" & GET /users/Cool-zimo',
-      '  ⚠️ 网页里没有 Python，这里跑的是 JavaScript。',
-      '     可用变量: resp（响应对象） status（状态码）',
-      '     可用函数: log() print() json() keys() len()',
+      '  ⚠️ 默认跑 JavaScript（网页里没有解释器，Pyodide 又太大）:',
+      '     JS 模式可用: resp status / log() print() json() keys() len()',
+      '     Python 模式可用: resp（dict） status（int）',
       '',
       '📌 PYON 块（多行，攒着一起跑）:',
       '  pyon',
-      '  ... "resp.login" & GET /users/Cool-zimo',
-      '  ... "log(keys(resp))"        ← 纯代码行，resp 沿用上一次',
+      '  ... "代码" & GET /users/Cool-zimo',
+      '  ... "代码"                   ← 纯代码行，resp 沿用上一次',
       '  ... PYEND                    ← 到此执行',
+      '',
+      '📌 真 Python（可选，默认关）:',
+      '  set download_python on    加载 Pyodide（约 10MB，带进度）',
+      '  set download_python off   关掉，回到 JavaScript 模式',
+      '  开启后 & 左边写真 Python，并多出一组文件系统命令：',
+      '     pwd   cd <dir>   ls [dir]   cat <文件>   mkdir <目录>',
+      '     rm <路径>   tree [dir]   write <文件> <内容>',
+      '  ⚠️ 这个盘是 Pyodide 的内存文件系统，关掉页面就没了，',
+      '     不是你电脑上的真实磁盘。',
       '',
       '📌 快捷键:',
       '  Tab 补全  ↑↓ 翻历史  Ctrl+L 清屏  Esc 取消多行',
@@ -1031,7 +1115,12 @@
     if (res === 'HISTORY') { printRaw(showHistory(), 'body'); return; }
     if (typeof res === 'string') { print('<span class="err">' + esc(res) + '</span>'); return; }
 
-    if (res[0] === 'SET') { printRaw(handleSet(res[1]), 'body'); return; }
+    if (res[0] === 'SET') {
+      var hs = handleSet(res[1]);
+      if (hs && hs[0] === 'PYLOAD') { doPyLoad(hs[1]); return; }
+      printRaw(hs, 'body');
+      return;
+    }
 
     // ── ! 别名：展开后回显一次，让人知道它变成了什么 ──
     if (res[0] === 'ALIAS') {
@@ -1099,6 +1188,9 @@
       })();
       return;
     }
+
+    // ── 文件系统命令 ──
+    if (res[0] === 'FS') { doFs(res[1], res[2]); return; }
 
     // ── diff a b ──
     if (res[0] === 'DIFF') { doDiff(res[1], res[2]); return; }
@@ -1203,10 +1295,220 @@
   }
 
   // ══════════════════════════════════════════════════════════════
+  //  Python 引擎（Pyodide）
+  //  默认不加载 —— 运行时约 10MB，一进页面就拉会把首屏毁掉。
+  //  set download_python on 才加载，并且只在本次会话有效（偏好记住，
+  //  下次打开会提示但不自动拉，免得每开一次都等十秒）。
+  // ══════════════════════════════════════════════════════════════
+  var PY_VER = '0.26.4';
+  var PY_BASE = 'https://cdn.jsdelivr.net/pyodide/v' + PY_VER + '/full/';
+  var _py = null;          // pyodide 实例
+  var _pyState = 'off';    // off | loading | ready | error
+
+  function pyReady() { return _pyState === 'ready' && !!_py; }
+
+  function pyMetaText() {
+    if (_pyState === 'ready') return '🐍 Python 就绪';
+    if (_pyState === 'loading') return '🐍 Python 加载中…';
+    if (_pyState === 'error') return '🐍 Python 加载失败';
+    return _pyPref ? '🐍 Python 未加载' : '🐍 Python 关';
+  }
+
+  function syncPyMeta() {
+    var el = document.getElementById('metaPy');
+    if (!el) return;
+    el.textContent = pyMetaText();
+    el.className = 'meta' + (_pyState === 'ready' ? ' pyok' : _pyState === 'error' ? ' pyerr' : '');
+  }
+
+  // 预热下载：loadPyodide 内部会自己再 fetch 一遍，但 URL 一致，
+  // 浏览器缓存会命中，所以这里先拉一遍只为拿到真实进度。
+  // 失败也不影响 —— 直接调 loadPyodide 照样能起来。
+  function warm(urls, onPct) {
+    var done = 0, total = urls.length;
+    function step() { if (onPct) onPct(Math.round(done / total * 100)); }
+    return Promise.all(urls.map(function (u) {
+      return fetch(u, { credentials: 'omit' }).then(function (r) {
+        if (!r.ok) throw new Error(u + ' → HTTP ' + r.status);
+        var len = +r.headers.get('Content-Length') || 0;
+        if (!r.body || !len) return r.arrayBuffer();   // 拿不到长度就退成整体下载
+        var got = 0;
+        var rd = r.body.getReader();
+        // 逐块读只为更新进度；数据本身丢掉，靠 HTTP 缓存留给 loadPyodide
+        return (function pump() {
+          return rd.read().then(function (x) {
+            if (x.done) return null;
+            got += x.value.length;
+            if (onPct) onPct(Math.round((done + got / len) / total * 100));
+            return pump();
+          });
+        })();
+      }).then(function () { done++; step(); })
+        .catch(function () { done++; step(); });   // 预热失败不阻断
+    }));
+  }
+
+  function loadPython(onPct) {
+    if (_pyState === 'ready' || _pyState === 'loading') return Promise.resolve(_pyState);
+    _pyState = 'loading';
+    syncPyMeta();
+    var t0 = Date.now();
+    var files = ['pyodide.asm.wasm', 'python_stdlib.zip'];
+    return warm(files.map(function (f) { return PY_BASE + f; }), onPct)
+      .then(function () {
+        if (onPct) onPct(100);
+        // ★ 动态 import：静态 import 会把 10MB 拖进首屏，关掉也照样下载
+        return import(/* webpackIgnore: true */ PY_BASE + 'pyodide.mjs');
+      })
+      .then(function (mod) {
+        return mod.loadPyodide({
+          indexURL: PY_BASE,
+          stdout: function (s) { print('<span class="pyout">' + esc(String(s).replace(/\n$/, '')) + '</span>'); },
+          stderr: function (s) { print('<span class="pyerr">' + esc(String(s).replace(/\n$/, '')) + '</span>'); }
+        });
+      })
+      .then(function (py) {
+        _py = py;
+        // 给它一个 workspace，pwd 出来好看点
+        try { py.runPython("import os\nos.makedirs('/home/work', exist_ok=True)\nos.chdir('/home/work')"); } catch (e) {}
+        _pyState = 'ready';
+        syncPyMeta();
+        print('<span class="tip">🐍 Python 就绪（Pyodide ' + PY_VER + '，用时 ' +
+              ((Date.now() - t0) / 1000).toFixed(1) + 's）· ' +
+              '现在 & 左边可以写真 Python，也能用 pwd / cd / ls / cat / mkdir / rm / write</span>');
+        return 'ready';
+      })
+      .catch(function (e) {
+        _pyState = 'error';
+        syncPyMeta();
+        print('<span class="err">Python 加载失败: ' + esc(String(e && e.message || e)) +
+              '\n多半是网络没连上 jsdelivr CDN，或被浏览器拦了。可以重试 set download_python on</span>');
+        return 'error';
+      });
+  }
+
+  // 把 JS 响应对象注入成纯 Python dict
+  // ★ 不能直接 py.globals.set 传 JS 对象：拿到的是 PyProxy，
+  //   dict 取值语义跟真 dict 不一样（上面踩过）。走 JSON 字符串最稳。
+  function pySetResp(obj, status) {
+    if (!pyReady()) return;
+    _py.globals.set('_resp_json', obj === undefined || obj === null ? 'null' : JSON.stringify(obj));
+    _py.globals.set('_status', status == null ? 0 : status);
+    _py.runPython('import json\nresp = json.loads(_resp_json) if _resp_json != "null" else None\nstatus = _status');
+  }
+
+  // 执行一段 Python：先按表达式求值并回显，SyntaxError 才退成语句块
+  // ★ 不能用 setStdout 捕获 print：实测它不生效（返回 undefined，回调一次都不调）。
+  //   真正管用的是 loadPyodide({stdout}) 这个全局回调 —— 所以 print 一律走它，
+  //   这里只负责判断"是表达式还是语句"，表达式才回显值。
+  //   判断交给 Python 自己的 ast，比 JS 端 try/catch 猜 SyntaxError 可靠：
+  //   print("hi") 是表达式（返回 None，不该回显），x=1 是语句（不该求值）。
+  function execPy(src, obj, status) {
+    if (!pyReady()) return false;
+    src = String(src || '').trim();
+    if (!src) return true;
+    pySetResp(obj, status);
+    try {
+      _py.globals.set('_src', src);
+      var isExpr = _py.runPython(
+        'import ast\n' +
+        'try:\n' +
+        '    ast.parse(_src, mode="eval")\n' +
+        '    _e = True\n' +
+        'except SyntaxError:\n' +
+        '    _e = False\n' +
+        '_e');
+      if (isExpr) {
+        _py.runPython('__v = eval(compile(_src, "<httpto>", "eval"))');
+        if (!_py.runPython('__v is None')) {           // print() 返回 None，不重复回显
+          printRaw(String(_py.runPython('__v if isinstance(__v, str) else repr(__v)')), 'pyout');
+        }
+      } else {
+        _py.runPython('exec(compile(_src, "<httpto>", "exec"))');
+      }
+      return true;
+    } catch (e) {
+      print('<span class="pyerr">' + esc(pyErrText(e)) + '</span>');
+      return false;
+    }
+  }
+
+  // Python 的 traceback 很长，只留最后几行有用的
+  function pyErrText(e) {
+    var s = String(e && e.message || e);
+    var lines = s.split('\n');
+    var i, keep = [];
+    for (i = 0; i < lines.length; i++) {
+      if (/^\s*File "/.test(lines[i]) && /_pyodide|python312\.zip/.test(lines[i])) continue;
+      keep.push(lines[i]);
+    }
+    var t = keep.join('\n').trim();
+    return t.length > 600 ? t.slice(0, 600) + '\n…' : t;
+  }
+
+  // ── 虚拟文件系统命令 ──
+  // Pyodide 跑在 Emscripten MEMFS 上，这个"磁盘"只在内存里，
+  // 关掉页面就没了 —— 得跟用户说清楚，否则会以为存下来了。
+  function pyFs() {
+    return {
+      pwd: function () { return _py.runPython('import os; os.getcwd()'); },
+      cd: function (d) {
+        if (!d) d = '/home/work';
+        _py.runPython('import os; os.chdir(' + JSON.stringify(d) + ')');
+        return _py.runPython('import os; os.getcwd()');
+      },
+      ls: function (d) {
+        return JSON.parse(_py.runPython(
+          'import os,json;' +
+          '_p=' + JSON.stringify(d || '.') + ';' +
+          '_e=sorted(os.listdir(_p));' +
+          'json.dumps([[x, os.path.isdir(os.path.join(_p,x))] for x in _e])'));
+      },
+      cat: function (f) { return _py.runPython('open(' + JSON.stringify(f) + ').read()'); },
+      mkdir: function (d) { _py.runPython('import os; os.makedirs(' + JSON.stringify(d) + ', exist_ok=True)'); return d; },
+      rm: function (f) {
+        _py.runPython('import os,shutil;' +
+          '_p=' + JSON.stringify(f) + ';' +
+          '(shutil.rmtree(_p) if os.path.isdir(_p) else os.remove(_p))');
+        return f;
+      },
+      write: function (f, content) {
+        _py.runPython('open(' + JSON.stringify(f) + ',"w").write(' + JSON.stringify(content) + ')');
+        return f;
+      },
+      tree: function (d) {
+        return _py.runPython(
+          'import os\n' +
+          '_root=' + JSON.stringify(d || '.') + '\n' +
+          '_out=[]\n' +
+          'def _w(p,pre):\n' +
+          '    es=sorted(os.listdir(p))\n' +
+          '    for i,x in enumerate(es):\n' +
+          '        _out.append(pre+("└─ " if i==len(es)-1 else "├─ ")+x)\n' +
+          '        if os.path.isdir(os.path.join(p,x)): _w(os.path.join(p,x),pre+("   " if i==len(es)-1 else "│  "))\n' +
+          '_w(_root,"")\n' +
+          '"\\n".join(_out)');
+      },
+      save: function (name, obj) {                 // > 文件：写进虚拟盘
+        _py.globals.set('_w_json', JSON.stringify(obj === undefined ? null : obj));
+        _py.runPython('import json;open(' + JSON.stringify(name) + ',"w").write(json.dumps(json.loads(_w_json),ensure_ascii=False,indent=2))');
+        return _py.runPython('import os; os.path.abspath(' + JSON.stringify(name) + ')');
+      }
+    };
+  }
+
+  function needPy() {
+    if (pyReady()) return false;
+    print('<span class="err">🐍 Python 还没加载。先执行 set download_python on（约 10MB，' +
+          '加载后可用真 Python 和 cd/ls/cat 等文件系统命令）</span>');
+    return true;
+  }
+
+  // ══════════════════════════════════════════════════════════════
   //  & 分隔符 / PYON 块
   //  命令行版是 python "code" & CLI，用 Python 处理 resp。
-  //  网页里没有 Python 解释器（Pyodide 要拉 ~10MB wasm，首屏受不了），
-  //  所以这里跑的是 JavaScript —— 语义一一对应：resp 就是响应对象。
+  //  没开 Python 时跑 JavaScript（网页里没有解释器，Pyodide 又太大，
+  //  不能默认拉）—— 语义一一对应：resp 就是响应对象。
   // ══════════════════════════════════════════════════════════════
 
   // ★ & 在 URL 查询串里太常见了（?a=1&b=2、q:python&sort=stars），
@@ -1235,6 +1537,12 @@
       return s.slice(1, -1);
     }
     return s;
+  }
+
+  // 代码侧统一入口：Python 就绪就跑真 Python，否则降级 JS
+  function execAny(code, obj, status) {
+    if (pyReady()) return execPy(code, obj, status);
+    return execJs(code, obj, status);
   }
 
   // 执行一段 JS：resp / status 注入为变量，log() 输出到终端。
@@ -1333,7 +1641,7 @@
     if (!p) return;
     p.then(function (got) {
       if (!got) return;
-      execJs(stripQuotes(js), got.obj, got.status);
+      execAny(stripQuotes(js), got.obj, got.status);
     });
   }
 
@@ -1362,7 +1670,7 @@
       }
       js = stripQuotes(js);
 
-      function after() { if (js) execJs(js, st.obj, st.status); step(); }
+      function after() { if (js) execAny(js, st.obj, st.status); step(); }
       if (cli) {
         var p = runCliFor(cli, true);          // 块内只打一行简报，别刷屏
         if (!p) { step(); return; }
@@ -1378,6 +1686,48 @@
       }
     }
     step();
+  }
+
+  // ── 虚拟文件系统命令 ──
+  function doFs(op, arg) {
+    if (needPy()) return;
+    var fs;
+    try { fs = pyFs(); } catch (e) { print('<span class="err">文件系统出错: ' + esc(pyErrText(e)) + '</span>'); return; }
+    try {
+      if (op === 'pwd') {
+        printRaw(fs.pwd(), 'pyout');
+      } else if (op === 'cd') {
+        var d = arg || '/home/work';
+        printRaw(fs.cd(d), 'pyout');
+      } else if (op === 'ls') {
+        var p = arg || '.';
+        var items = fs.ls(p);
+        if (!items.length) { print('<span class="dim">（空目录）</span>'); return; }
+        var lns = [p === '.' ? fs.pwd() : p];
+        items.forEach(function (it) { lns.push((it[1] ? '📁 ' : '   ') + it[0]); });
+        printRaw(lns.join('\n'), 'pyout');
+      } else if (op === 'cat') {
+        if (!arg) { print('<span class="err">用法: cat <文件></span>'); return; }
+        printRaw(fs.cat(arg), 'pyout');
+      } else if (op === 'mkdir') {
+        if (!arg) { print('<span class="err">用法: mkdir <目录></span>'); return; }
+        printRaw('📁 ' + fs.mkdir(arg), 'pyout');
+      } else if (op === 'rm') {
+        if (!arg) { print('<span class="err">用法: rm <文件或目录></span>'); return; }
+        printRaw('🗑 已删除 ' + fs.rm(arg), 'pyout');
+      } else if (op === 'tree') {
+        var t = fs.tree(arg || '.');
+        printRaw((arg && arg !== '.' ? arg + '\n' : fs.pwd() + '\n') + (t || '（空）'), 'pyout');
+      } else if (op === 'write') {
+        // write <文件> <内容>：内容整段照抄，不解析
+        var sp = arg.indexOf(' ');
+        if (sp < 0) { print('<span class="err">用法: write <文件> <内容></span>'); return; }
+        var fn = arg.slice(0, sp), ct = arg.slice(sp + 1);
+        printRaw('💾 ' + fs.write(fn, ct) + '（' + ct.length + ' 字符）', 'pyout');
+      }
+    } catch (e) {
+      print('<span class="err">' + esc(pyErrText(e)) + '</span>');
+    }
   }
 
   // 续行模式收尾：把整段 body 重新走一遍解析（这样 -n / -headers 也能用）
@@ -1464,9 +1814,9 @@
   function drawBanner() {
     var b = [
       '  ┌────────────────────────────────────────────┐',
-      '  │   HTTPto v5.0 · 任意链接 HTTP 终端          │',
+      '  │   HTTPto v6.0 · 任意链接 HTTP 终端          │',
       '  │   GET / POST / PUT / PATCH / DELETE         │',
-      '  │  & 分隔符 · PYON 块 · 管道 · diff · curl    │',
+      '  │  & 分隔符 · PYON · Python(可选) · 管道 · curl │',
       '  └────────────────────────────────────────────┘',
       '',
       '  输入 help 看帮助，apis 看速查表。',
@@ -1474,6 +1824,12 @@
       ''
     ].join('\n');
     print('<span class="banner">' + esc(b) + '</span>');
+    // ★ 上次开过 Python 但这次没加载（不自动拉 10MB），得说一声，
+    //   否则用户敲 cd / ls 只会得到"Python 还没加载"，一头雾水。
+    if (_pyPref && _pyState !== 'ready') {
+      print('<span class="tip">🐍 上次启用过 Python，这次没自动加载（约 10MB）。' +
+            '要用真 Python 和 cd/ls/cat 就输入: set download_python on</span>');
+    }
   }
 
   // ── 事件 ──
@@ -1546,7 +1902,8 @@
   }
 
   var CMDS = ['help', 'config', 'apis', 'fields', 'history', 'presets', 'set',
-              'exit', 'use', 'replay', 'repeat', 'diff', 'gen', 'mock', 'pyon'];
+              'exit', 'use', 'replay', 'repeat', 'diff', 'gen', 'mock', 'pyon',
+              'pwd', 'ls', 'cd', 'cat', 'mkdir', 'rm', 'tree', 'write'];
   var METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
 
   function complete() {
@@ -1598,5 +1955,6 @@
   banner();
   restoreLog();
   syncMeta();
+  syncPyMeta();
   cmd.focus();
 })();
